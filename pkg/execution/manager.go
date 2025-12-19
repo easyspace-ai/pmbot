@@ -2,6 +2,7 @@ package execution
 
 import (
 	"log"
+	"math" // Add import
 	"sync"
 	"time"
 
@@ -38,7 +39,10 @@ func (em *ExecutionManager) Start() {
 	// 1. Recover Open Orders from DB
 	em.reconcileOrders()
 
-	// 2. Start listening to order updates (Simulated via Client callbacks in real version)
+	// 2. Start listening to order updates
+	// em.orderUpdateCh = em.client.SubscribeOrders() 
+	// We consume directly in processOrderUpdates
+	
 	go em.processOrderUpdates()
 }
 
@@ -99,12 +103,7 @@ func (em *ExecutionManager) ExecuteIntent(action types.ControlAction, currentPos
 		em.placeOrder(side, diff, execPrice, "IOC") // Immediate or Cancel
 		
 	} else {
-		// MAKER STRATEGY: Passive execution
-		// We want to post orders at best bid/ask
-		// Implementation needed: Check if we already have open orders. 
-		// If yes, reprice them. If no, place new.
-		
-		// Simplified for v1: Just place Limit Order at Mid Price or Best Bid
+		// MAKER STRATEGY: Passive execution (Repricing)
 		side := "BUY"
 		if diff < 0 {
 			side = "SELL"
@@ -113,16 +112,54 @@ func (em *ExecutionManager) ExecuteIntent(action types.ControlAction, currentPos
 		
 		limitPrice := bestBid 
 		if side == "BUY" {
-			// Join the bid
 			limitPrice = bestBid
 			if limitPrice == 0 { limitPrice = bestAsk * 0.99 }
 		} else {
-			// Join the ask
 			limitPrice = bestAsk
 			if limitPrice == 0 { limitPrice = bestBid * 1.01 }
 		}
 		
-		em.placeOrder(side, diff, limitPrice, "GTC")
+		// 1. Check existing orders
+		orders, _ := em.store.GetOpenOrders()
+		activeToken := em.client.ActiveToken()
+		
+		var existingOrderID string
+		var existingPrice float64
+		
+		for _, o := range orders {
+			if o["token_id"] == activeToken && o["side"] == side {
+				existingOrderID = o["id"].(string)
+				existingPrice = o["price"].(float64)
+				break
+			}
+		}
+		
+		if existingOrderID != "" {
+			// Check Reprice Condition (e.g. price deviation > 1%)
+			// Or if we are not at top of book
+			priceDiff := math.Abs(existingPrice - limitPrice)
+			if priceDiff > limitPrice * 0.005 { // 0.5% tolerance
+				log.Printf("Repricing Order %s: Old=%.2f New=%.2f", existingOrderID, existingPrice, limitPrice)
+				// Cancel
+				em.cancelOrder(existingOrderID)
+				// Place New (Next Loop? Or Immediately?)
+				// Immediate to avoid missing out
+				em.placeOrder(side, diff, limitPrice, "GTC")
+			}
+			// If price is good, do nothing (keep resting)
+		} else {
+			// No open order, place one
+			em.placeOrder(side, diff, limitPrice, "GTC")
+		}
+	}
+}
+
+func (em *ExecutionManager) cancelOrder(orderID string) {
+	err := em.client.CancelOrder(orderID)
+	if err != nil {
+		log.Printf("Cancel Failed: %v", err)
+	} else {
+		em.store.UpdateOrderStatus(orderID, "CANCELED", 0)
 	}
 }
 
@@ -146,7 +183,14 @@ func (em *ExecutionManager) placeOrder(side string, size, price float64, type_ s
 		log.Printf("Order Failed: %v", err)
 	} else {
 		// Save to DB
-		// em.store.SaveOrder(...)
+		// Use auto-generated ID as Client ID. Exchange ID might be different but we don't have it synchronously unless API returns it.
+		// For EIP712, we can pre-calculate Order Hash if we want deep tracking.
+		// For now, storing under ID.
+		tokenID := em.client.ActiveToken()
+		err = em.store.SaveOrder(req.ID, req.ID, tokenID, side, "NEW", price, size)
+		if err != nil {
+			log.Printf("Failed to save order to DB: %v", err)
+		}
 	}
 }
 
@@ -161,5 +205,18 @@ func (em *ExecutionManager) reconcileOrders() {
 }
 
 func (em *ExecutionManager) processOrderUpdates() {
-	// In a real system, this consumes from WS
+	updates := em.client.SubscribeOrders()
+	for update := range updates {
+		log.Printf("Order Update: ID=%s Status=%s Filled=%.2f", update.OrderID, update.Status, update.FilledSize)
+		
+		// Update DB
+		err := em.store.UpdateOrderStatus(update.OrderID, update.Status, update.FilledSize)
+		if err != nil {
+			log.Printf("Failed to update order status in DB: %v", err)
+		}
+		
+		// Update Risk Manager (Equity / Position) if Filled
+		// Ideally we delta update based on FilledSize change.
+		// For now, simple logging. Real impl would query positions from chain or update local tracking.
+	}
 }

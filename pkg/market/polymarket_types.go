@@ -42,9 +42,16 @@ type WsRequest struct {
 }
 
 type WsResponse struct {
-	Event     string             `json:"event"` // "book", "price_change"
+	Event     string             `json:"event"` // "book", "price_change", "order"
 	Market    string             `json:"market"`
 	Bids      []OrderbookLevel   `json:"bids"`
 	Asks      []OrderbookLevel   `json:"asks"`
 	Timestamp string             `json:"timestamp"`
+	
+	// Order Update Fields
+	ID           string `json:"id"`
+	clientOrderID string `json:"client_order_id"`
+	Status       string `json:"status"` // OPEN, MATCHED, CANCELED
+	Size         string `json:"size"`
+	FilledSize   string `json:"size_matched"` // or filled_size
 }

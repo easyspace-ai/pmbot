@@ -85,16 +85,18 @@ func main() {
 		}
 
 		// D. Brain Compute
-		action := controller.Compute(sig)
+		// We need to fetch current position from Store to pass to Brain (Inventory Awareness)
+		currentPos := 0.0
+		if polyClient != nil && polyClient.ActiveToken() != "" {
+			amount, _, err := db.GetPosition(polyClient.ActiveToken())
+			if err == nil {
+				currentPos = amount
+			}
+		}
+
+		action := controller.Compute(sig, currentPos)
 
 		// E. Execution (Smart Router)
-		// We need to fetch current position from Store to pass to Execution
-		// Assuming we track "Active Token" position
-		// In real impl, we'd query by polyClient.ActiveToken()
-		currentPos := 0.0
-		// Fetch actual pos from DB
-		// amount, _, _ := db.GetPosition(polyClient.ActiveToken())
-		// currentPos = amount
 		
 		// We need Best Bid/Ask for execution logic. 
 		// MarketData struct has Mid Price, but we might want raw bid/ask from client if available.

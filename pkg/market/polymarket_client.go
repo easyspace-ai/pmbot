@@ -1,6 +1,9 @@
 package market
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,6 +30,7 @@ type PolymarketClient struct {
 	signer      *Signer
 	nonceMgr    *NonceManager // Add NonceManager
 	dataCh      chan types.MarketData
+	orderCh     chan types.OrderUpdate // New channel for order updates
 	stopCh      chan struct{}
 	activeToken string // The Token ID we are currently tracking (usually the YES token)
 	marketId    string // The condition ID
@@ -58,10 +62,19 @@ func NewPolymarketClient(cfg *config.Config) *PolymarketClient {
 		signer:      signer,
 		nonceMgr:    nonceMgr,
 		dataCh:      make(chan types.MarketData, 100),
+		orderCh:     make(chan types.OrderUpdate, 100),
 		stopCh:      make(chan struct{}),
 		currentBids: make(map[float64]float64),
 		currentAsks: make(map[float64]float64),
 	}
+}
+
+func (c *PolymarketClient) ActiveToken() string {
+	return c.activeToken
+}
+
+func (c *PolymarketClient) SubscribeOrders() <-chan types.OrderUpdate {
+	return c.orderCh
 }
 
 func (c *PolymarketClient) Subscribe() <-chan types.MarketData {
@@ -274,6 +287,43 @@ func (c *PolymarketClient) SubmitOrder(order types.OrderRequest) error {
 	return nil
 }
 
+func (c *PolymarketClient) CancelOrder(orderID string) error {
+	if c.signer == nil {
+		return fmt.Errorf("signer not initialized")
+	}
+
+	// Body: { "orderIds": ["..."] }
+	reqBody := map[string]interface{}{
+		"orderIds": []string{orderID},
+	}
+	jsonBody, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequest("DELETE", ClobApiUrl+"/order", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return err
+	}
+
+	headers := c.signer.GenerateAuthHeaders("DELETE", "/order", string(jsonBody))
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("cancel failed: %s", resp.Status)
+	}
+	
+	log.Printf("Order Cancelled: %s", orderID)
+	return nil
+}
+
 // findActiveMarket attempts to find the nearest 15min BTC market
 func (c *PolymarketClient) findActiveMarket() error {
 	// WARNING: Fetching all markets is heavy. In production, use specific params if available.
@@ -364,7 +414,40 @@ func (c *PolymarketClient) runWebsocket() {
 
 	log.Printf("WS Connected to %s", WsUrl)
 
-	// Subscribe to Orderbook using New CLOB format
+	// 1. Authenticate if we have credentials (for User Orders)
+	if c.signer != nil {
+		// Prepare Auth
+		// Timestamp
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		// Sign: timestamp + "GET" + "/ws/users" (Standard Clob pattern)
+		// We can reuse the inner logic of GenerateAuthHeaders if we expose it or copy it.
+		// Let's copy the HMAC logic here for simplicity as it's small.
+		
+		msg := ts + "GET" + "/ws/users"
+		
+		secretBytes, _ := base64.StdEncoding.DecodeString(c.signer.ApiSecret) 
+		// Fallback handling inside signer is not accessible here easily unless we export it.
+		// Assuming secret is base64 for now.
+		
+		h := hmac.New(sha256.New, secretBytes)
+		h.Write([]byte(msg))
+		sig := base64.StdEncoding.EncodeToString(h.Sum(nil))
+		
+		authMsg := map[string]interface{}{
+			"type": "auth",
+			"key": c.signer.ApiKey,
+			"signature": sig,
+			"timestamp": ts,
+			"passphrase": c.signer.ApiPassphrase,
+		}
+		if err := conn.WriteJSON(authMsg); err != nil {
+			log.Printf("WS Auth failed: %v", err)
+		} else {
+			log.Println("WS Authenticated (Listening for User Orders)")
+		}
+	}
+
+	// 2. Subscribe to Orderbook using New CLOB format
 	subMsg := map[string]interface{}{
 		"assets": []string{c.activeToken},
 		"type":   "market",
@@ -413,6 +496,25 @@ func (c *PolymarketClient) handleWsMessage(msg []byte) {
 		if m.Event == "book" || m.Event == "price_change" {
 			c.updateOrderbook(m)
 			c.emitMarketData()
+		} else if m.Event == "order" || m.Event == "orders" { // Handle Order Updates
+			// Parse Order Update
+			// Note: The fields might be different depending on API version. 
+			// Assuming WsResponse fields match.
+			
+			filled, _ := strconv.ParseFloat(m.FilledSize, 64)
+			
+			update := types.OrderUpdate{
+				OrderID:    m.ID,
+				Status:     m.Status,
+				FilledSize: filled,
+				Timestamp:  time.Now(),
+			}
+			
+			// Non-blocking send
+			select {
+			case c.orderCh <- update:
+			default:
+			}
 		}
 	}
 }

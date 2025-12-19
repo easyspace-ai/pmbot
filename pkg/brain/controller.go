@@ -23,10 +23,19 @@ func NewController(cfg Config) *Controller {
 	}
 }
 
-// Compute calculates the next control action based on the market signal
-func (c *Controller) Compute(signal types.MarketSignal) types.ControlAction {
+// Compute calculates the next control action based on the market signal and current inventory
+func (c *Controller) Compute(signal types.MarketSignal, currentInventory float64) types.ControlAction {
 	// 1. Calculate Auto-Gain
 	gain := c.calculateAutoGain(signal)
+
+	// Inventory Skew: If we are near max risk, reduce gain to prevent over-exposure
+	// This acts as a soft cap or damper
+	usage := math.Abs(currentInventory) / c.config.MaxRisk
+	if usage > 0.8 {
+		gain *= (1.0 - (usage - 0.8) * 2) // Linearly decay to 0.6x at usage=1.0?
+		// At usage=1.0, factor = 1 - 0.4 = 0.6.
+		if gain < 0.1 { gain = 0.1 }
+	}
 
 	// 2. Calculate Weights for Dual-Channel
 	// w (normal weight) depends on stability. High velocity/accel -> lower w (more shock)
