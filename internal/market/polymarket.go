@@ -275,8 +275,10 @@ type clobToken struct {
 
 func (p *Polymarket) discover(ctx context.Context) error {
 	if p.marketSlugRegex == nil && (p.yesTokenID == "" || p.noTokenID == "" || p.marketID == "") {
-		// Default heuristic for BTC 15m markets; user can override with POLY_MARKET_SLUG_REGEX.
-		p.marketSlugRegex = regexp.MustCompile(`(?i)btc.*15|min.*btc|15.*btc`)
+		// Default strict pattern for BTC 15m Up/Down markets:
+		// btc-updown-15m-<unix_timestamp>
+		// User can override with POLY_MARKET_SLUG_REGEX.
+		p.marketSlugRegex = regexp.MustCompile(`^btc-updown-15m-\d+$`)
 	}
 
 	limit := 200
@@ -302,7 +304,8 @@ func (p *Polymarket) discover(ctx context.Context) error {
 		}
 
 		for _, m := range resp.Data {
-			if p.marketSlugRegex != nil && !p.marketSlugRegex.MatchString(m.MarketSlug) && !p.marketSlugRegex.MatchString(m.Question) {
+			// For BTC 15m markets we key off market_slug format; question text is not stable.
+			if p.marketSlugRegex != nil && !p.marketSlugRegex.MatchString(m.MarketSlug) {
 				continue
 			}
 			if !m.EnableOrderBook || !m.AcceptingOrders || m.Closed || !m.Active {
@@ -322,6 +325,7 @@ func (p *Polymarket) discover(ctx context.Context) error {
 			}
 
 			c := &cand{m: m, end: end, yes: yes, no: no}
+			// Pick the market with the nearest upcoming end time.
 			if best == nil || c.end.Before(best.end) {
 				best = c
 			}
