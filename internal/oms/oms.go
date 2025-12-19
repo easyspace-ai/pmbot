@@ -123,6 +123,20 @@ func (o *OMS) Reset() {
 // OrderCount returns the number of locally tracked orders (for diagnostics/tests).
 func (o *OMS) OrderCount() int { return len(o.orders) }
 
+// OpenOrderCount returns number of orders that are still potentially live on exchange.
+func (o *OMS) OpenOrderCount() int {
+	n := 0
+	for _, ord := range o.orders {
+		switch ord.State {
+		case StateNew, StateAck, StatePartFilled, StateCanceling:
+			n++
+		}
+	}
+	return n
+}
+
+func (o *OMS) HasOpenOrders() bool { return o.OpenOrderCount() > 0 }
+
 // CancelAll attempts to cancel all open orders (best-effort).
 func (o *OMS) CancelAll(ctx context.Context, exec Execution) {
 	o.cancelAllOpen(ctx, exec)

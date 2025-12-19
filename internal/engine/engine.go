@@ -36,6 +36,12 @@ type Engine struct {
 	lastRisk types.RiskState
 
 	currentMarketID string
+
+	// Cycle transition state (close-book).
+	transitioning    bool
+	pendingSnapshot  *types.MarketSnapshot
+	transitionStart  time.Time
+	lastFillTs       time.Time
 }
 
 type Config struct {
@@ -97,30 +103,26 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 			e.log.Warn("bad payload type", "event", ev.Type)
 			return
 		}
-		// New cycle boundary: cancel outstanding orders and clear per-cycle state.
+		// New cycle boundary: enter transition mode, close book, then reset state.
 		if snap.MarketID != "" && snap.MarketID != e.currentMarketID {
-			// Best-effort cancel before resetting.
-			if e.oms != nil && e.market != nil {
-				e.oms.CancelAll(ctx, e.market)
+			e.pendingSnapshot = &snap
+			if !e.transitioning {
+				e.transitioning = true
+				e.transitionStart = time.Now().UTC()
+				e.lastFillTs = time.Time{}
+
+				// Freeze trading immediately; try to cancel all outstanding orders.
+				if e.oms != nil && e.market != nil {
+					e.oms.CancelAll(ctx, e.market)
+				}
 			}
-			if e.oms != nil {
-				e.oms.Reset()
+			// If currentMarketID is empty (first boot), we can apply immediately (no close-book needed).
+			if e.currentMarketID == "" {
+				e.applyNewCycle(ctx, snap)
+				e.transitioning = false
+				e.pendingSnapshot = nil
 			}
-			if e.pos != nil {
-				e.pos.Reset()
-			}
-			if e.signals != nil {
-				e.signals.Reset()
-			}
-			e.lastTick = nil
-			e.lastRisk = types.RiskState{Ts: time.Now().UTC()}
-			e.currentMarketID = snap.MarketID
-			e.log.Info("cycle switched",
-				"market_id", snap.MarketID,
-				"slug", snap.MarketSlug,
-				"cycle_start", snap.CycleStart.Format(time.RFC3339),
-				"end", snap.EndDate.Format(time.RFC3339),
-			)
+			return
 		}
 
 	case types.EventMarketTick:
@@ -142,6 +144,12 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 		// Update risk supervisors first.
 		if e.risk != nil {
 			e.lastRisk = e.risk.Evaluate(tick, e.pos)
+		}
+
+		// During cycle transition we do not trade; we only process reconciliation events.
+		if e.transitioning {
+			e.maybeCompleteTransition(ctx)
+			return
 		}
 
 		// If kill-switch is active, OMS must not create new exposure.
@@ -174,6 +182,9 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 		if e.pos != nil {
 			e.pos.OnOrderUpdate(upd)
 		}
+		if e.transitioning {
+			e.maybeCompleteTransition(ctx)
+		}
 
 	case types.EventFill:
 		if e.pos == nil {
@@ -185,6 +196,10 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 			return
 		}
 		e.pos.OnFill(fill)
+		e.lastFillTs = time.Now().UTC()
+		if e.transitioning {
+			e.maybeCompleteTransition(ctx)
+		}
 
 	case types.EventRisk:
 		// Direct risk events (from adapters/health checks) can force kill-switch.
@@ -198,4 +213,85 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 			e.oms.OnRisk(ctx, rs, e.market)
 		}
 	}
+}
+
+func (e *Engine) maybeCompleteTransition(ctx context.Context) {
+	if !e.transitioning || e.pendingSnapshot == nil {
+		return
+	}
+
+	// Conditions:
+	// 1) No locally tracked open orders
+	// 2) No fills observed for a short quiet window
+	// 3) Timeout protection
+	now := time.Now().UTC()
+	if now.Sub(e.transitionStart) > 12*time.Second {
+		// Can't safely close; stop trading.
+		e.lastRisk = types.RiskState{KillSwitch: true, Freeze: true, Reason: "cycle_transition_timeout", Ts: now}
+		e.transitioning = false
+		return
+	}
+
+	openOrders := false
+	if e.oms != nil {
+		openOrders = e.oms.HasOpenOrders()
+	}
+	quiet := e.lastFillTs.IsZero() || now.Sub(e.lastFillTs) > 2*time.Second
+
+	if openOrders {
+		// Keep attempting cancels while waiting.
+		if e.oms != nil && e.market != nil {
+			e.oms.CancelAll(ctx, e.market)
+		}
+		return
+	}
+	if !quiet {
+		return
+	}
+
+	// Close-book finished; apply new cycle.
+	e.applyNewCycle(ctx, *e.pendingSnapshot)
+	e.transitioning = false
+	e.pendingSnapshot = nil
+}
+
+func (e *Engine) applyNewCycle(ctx context.Context, snap types.MarketSnapshot) {
+	// Capture any residual local position and trip kill-switch if non-zero.
+	var residualYes, residualNo, residualConf float64
+	if e.pos != nil {
+		y, n, _, conf, _ := e.pos.Snapshot()
+		residualYes, residualNo, residualConf = y, n, conf
+	}
+
+	if e.oms != nil {
+		e.oms.Reset()
+	}
+	if e.pos != nil {
+		e.pos.Reset()
+	}
+	if e.signals != nil {
+		e.signals.Reset()
+	}
+	e.lastTick = nil
+	e.lastRisk = types.RiskState{Ts: time.Now().UTC()}
+	e.currentMarketID = snap.MarketID
+
+	// If we had any residual local position, stop trading for safety.
+	if residualYes != 0 || residualNo != 0 || residualConf != 0 {
+		e.lastRisk = types.RiskState{
+			KillSwitch: true,
+			Freeze:     true,
+			Reason:     "residual_position_on_cycle_switch",
+			Ts:         time.Now().UTC(),
+		}
+	}
+
+	e.log.Info("cycle switched",
+		"market_id", snap.MarketID,
+		"slug", snap.MarketSlug,
+		"cycle_start", snap.CycleStart.Format(time.RFC3339),
+		"end", snap.EndDate.Format(time.RFC3339),
+	)
+
+	_ = ctx
 }
