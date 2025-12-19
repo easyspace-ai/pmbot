@@ -3,10 +3,8 @@ package market
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -14,7 +12,6 @@ import (
 	"time"
 
 	"polymarket-btc-bot/internal/bus"
-	"polymarket-btc-bot/internal/oms"
 	"polymarket-btc-bot/internal/types"
 )
 
@@ -41,6 +38,20 @@ type Polymarket struct {
 	pollInterval time.Duration
 
 	endDate time.Time
+
+	// Market microstructure
+	minTickSize  string
+	minOrderSize float64
+	negRisk      bool
+
+	// Trading (CLOB L1/L2 auth + EIP712 order signing)
+	tradingEnabled bool
+	chainID        int64
+	privateKey     string
+	address        string
+	funder         string
+	signatureType  uint8
+	apiCreds       *apiCreds
 }
 
 type PolymarketConfig struct {
@@ -50,6 +61,17 @@ type PolymarketConfig struct {
 	NoTokenID       string
 	MarketID        string
 	PollInterval    time.Duration
+
+	TradingEnabled bool
+	ChainID        int64
+	PrivateKey     string
+	Funder         string
+	SignatureType  uint8
+
+	// Optional: directly provide L2 API creds (skip L1 create/derive)
+	APIKey        string
+	APISecret     string
+	APIPassphrase string
 }
 
 func NewPolymarketFromEnv(log *slog.Logger) *Polymarket {
@@ -60,6 +82,16 @@ func NewPolymarketFromEnv(log *slog.Logger) *Polymarket {
 		NoTokenID:       os.Getenv("POLY_NO_TOKEN_ID"),
 		MarketID:        os.Getenv("POLY_MARKET_ID"),
 		PollInterval:    parseDurationDefault(os.Getenv("POLY_POLL_INTERVAL"), 300*time.Millisecond),
+
+		TradingEnabled: os.Getenv("POLY_TRADING_ENABLED") == "1",
+		ChainID:        parseInt64Default(os.Getenv("POLY_CHAIN_ID"), 137),
+		PrivateKey:     os.Getenv("POLY_PRIVATE_KEY"),
+		Funder:         os.Getenv("POLY_FUNDER"),
+		SignatureType:  uint8(parseInt64Default(os.Getenv("POLY_SIGNATURE_TYPE"), 0)),
+
+		APIKey:        os.Getenv("POLY_API_KEY"),
+		APISecret:     os.Getenv("POLY_API_SECRET"),
+		APIPassphrase: os.Getenv("POLY_API_PASSPHRASE"),
 	}
 	return NewPolymarket(log, cfg)
 }
@@ -73,14 +105,21 @@ func NewPolymarket(log *slog.Logger, cfg PolymarketConfig) *Polymarket {
 		re = regexp.MustCompile(cfg.MarketSlugRegex)
 	}
 	return &Polymarket{
-		log:            log,
-		http:           &http.Client{Timeout: 15 * time.Second},
-		baseURL:        cfg.BaseURL,
+		log:             log,
+		http:            &http.Client{Timeout: 15 * time.Second},
+		baseURL:         cfg.BaseURL,
 		marketSlugRegex: re,
-		yesTokenID:     cfg.YesTokenID,
-		noTokenID:      cfg.NoTokenID,
-		marketID:       cfg.MarketID,
-		pollInterval:   cfg.PollInterval,
+		yesTokenID:      cfg.YesTokenID,
+		noTokenID:       cfg.NoTokenID,
+		marketID:        cfg.MarketID,
+		pollInterval:    cfg.PollInterval,
+
+		tradingEnabled: cfg.TradingEnabled,
+		chainID:        cfg.ChainID,
+		privateKey:     cfg.PrivateKey,
+		funder:         cfg.Funder,
+		signatureType:  cfg.SignatureType,
+		apiCreds:       newApiCredsFromEnv(cfg.APIKey, cfg.APISecret, cfg.APIPassphrase),
 	}
 }
 
@@ -98,7 +137,14 @@ func (p *Polymarket) Start(ctx context.Context, b *bus.Bus) error {
 		"no_token_id", p.noTokenID,
 		"end_date", p.endDate.Format(time.RFC3339),
 		"poll_interval", p.pollInterval.String(),
+		"trading_enabled", p.tradingEnabled,
 	)
+
+	if p.tradingEnabled {
+		if err := p.initTrading(ctx); err != nil {
+			return err
+		}
+	}
 
 	go p.pollLoop(ctx, b)
 	return nil
@@ -147,12 +193,12 @@ func (p *Polymarket) pollLoop(ctx context.Context, b *bus.Bus) {
 			_ = b.Publish(ctx, types.Event{
 				Type: types.EventMarketTick,
 				Payload: types.MarketTick{
-					MarketID:       p.marketID,
-					PYes:           clamp01(pYes),
-					BestBid:        clamp01(bestBid),
-					BestAsk:        clamp01(bestAsk),
-					TimeRemaining:  rem,
-					DataQuality:    dq,
+					MarketID:      p.marketID,
+					PYes:          clamp01(pYes),
+					BestBid:       clamp01(bestBid),
+					BestAsk:       clamp01(bestAsk),
+					TimeRemaining: rem,
+					DataQuality:   dq,
 				},
 				TsExchange: ts,
 			})
@@ -160,43 +206,28 @@ func (p *Polymarket) pollLoop(ctx context.Context, b *bus.Bus) {
 	}
 }
 
-// PlaceOrder/CancelOrder: scaffold only.
-// Polymarket CLOB authenticated trading requires request signing. This varies by account type
-// and is intentionally left behind a feature flag so the bot can still run on public data.
-
-var ErrTradingNotConfigured = errors.New("polymarket trading not configured (set POLY_TRADING_ENABLED=1 and credentials)")
-
-func (p *Polymarket) PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) (oms.PlaceOrderResult, error) {
-	_ = ctx
-	_ = req
-	return oms.PlaceOrderResult{Accepted: false, Reason: "not_configured"}, ErrTradingNotConfigured
-}
-
-func (p *Polymarket) CancelOrder(ctx context.Context, req oms.CancelOrderRequest) (oms.CancelOrderResult, error) {
-	_ = ctx
-	_ = req
-	return oms.CancelOrderResult{Ok: false, Reason: "not_configured"}, ErrTradingNotConfigured
-}
-
 // --- Discovery & HTTP ---
 
 type clobMarketsResponse struct {
-	Count      int64       `json:"count"`
-	Limit      int         `json:"limit"`
-	NextCursor string      `json:"next_cursor"`
+	Count      int64        `json:"count"`
+	Limit      int          `json:"limit"`
+	NextCursor string       `json:"next_cursor"`
 	Data       []clobMarket `json:"data"`
 }
 
 type clobMarket struct {
-	MarketSlug        string       `json:"market_slug"`
-	Question          string       `json:"question"`
-	EndDateISO        string       `json:"end_date_iso"`
-	EnableOrderBook   bool         `json:"enable_order_book"`
-	AcceptingOrders   bool         `json:"accepting_orders"`
-	Closed            bool         `json:"closed"`
-	Active            bool         `json:"active"`
-	ConditionID       string       `json:"condition_id"`
-	Tokens            []clobToken  `json:"tokens"`
+	MarketSlug      string      `json:"market_slug"`
+	Question        string      `json:"question"`
+	EndDateISO      string      `json:"end_date_iso"`
+	EnableOrderBook bool        `json:"enable_order_book"`
+	AcceptingOrders bool        `json:"accepting_orders"`
+	Closed          bool        `json:"closed"`
+	Active          bool        `json:"active"`
+	NegRisk         bool        `json:"neg_risk"`
+	ConditionID     string      `json:"condition_id"`
+	MinOrderSize    float64     `json:"minimum_order_size"`
+	MinTickSize     float64     `json:"minimum_tick_size"`
+	Tokens          []clobToken `json:"tokens"`
 }
 
 type clobToken struct {
@@ -244,6 +275,9 @@ func (p *Polymarket) discover(ctx context.Context) error {
 			p.yesTokenID = yes
 			p.noTokenID = no
 			p.endDate = end
+			p.negRisk = m.NegRisk
+			p.minOrderSize = m.MinOrderSize
+			p.minTickSize = fmtTickSize(m.MinTickSize)
 			return nil
 		}
 
@@ -262,10 +296,10 @@ func (p *Polymarket) discover(ctx context.Context) error {
 }
 
 type clobBook struct {
-	AssetID   string        `json:"asset_id"`
-	Timestamp string        `json:"timestamp"`
-	Bids      []clobLevel   `json:"bids"`
-	Asks      []clobLevel   `json:"asks"`
+	AssetID   string      `json:"asset_id"`
+	Timestamp string      `json:"timestamp"`
+	Bids      []clobLevel `json:"bids"`
+	Asks      []clobLevel `json:"asks"`
 }
 
 type clobLevel struct {
@@ -377,7 +411,3 @@ func getenvDefault(k, def string) string {
 	}
 	return v
 }
-
-// ensure imports used
-var _ = math.Abs
-
