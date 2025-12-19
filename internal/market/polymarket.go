@@ -52,6 +52,9 @@ type Polymarket struct {
 	funder         string
 	signatureType  uint8
 	apiCreds       *apiCreds
+
+	// L2 polling cursors/dedup
+	ordersCursor string
 }
 
 type PolymarketConfig struct {
@@ -144,6 +147,10 @@ func (p *Polymarket) Start(ctx context.Context, b *bus.Bus) error {
 		if err := p.initTrading(ctx); err != nil {
 			return err
 		}
+
+		// Start authenticated polling for order updates / fills.
+		go p.pollOrdersLoop(ctx, b)
+		go p.pollTradesLoop(ctx, b)
 	}
 
 	go p.pollLoop(ctx, b)
@@ -160,6 +167,36 @@ func (p *Polymarket) pollLoop(ctx context.Context, b *bus.Bus) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Rotate market when it ends (15m markets roll frequently).
+			if !p.endDate.IsZero() && time.Now().UTC().After(p.endDate) {
+				_ = b.Publish(ctx, types.Event{
+					Type: types.EventRisk,
+					Payload: types.RiskState{
+						KillSwitch: false,
+						Freeze:     true,
+						Reason:     "market_expired_rotate",
+						Ts:         time.Now().UTC(),
+					},
+				})
+
+				if err := p.discover(ctx); err != nil {
+					_ = b.Publish(ctx, types.Event{
+						Type: types.EventRisk,
+						Payload: types.RiskState{
+							KillSwitch: true,
+							Freeze:     true,
+							Reason:     "discover_failed:" + err.Error(),
+							Ts:         time.Now().UTC(),
+						},
+					})
+					continue
+				}
+
+				// Reset L2 cursors after rotation.
+				p.ordersCursor = "MA=="
+				lastGood = time.Time{}
+			}
+
 			bestBid, bestAsk, ts, err := p.getBestBidAsk(ctx, p.yesTokenID)
 			dq := 0.0
 			if err == nil && bestBid > 0 && bestAsk > 0 && bestBid <= bestAsk && !ts.IsZero() {
@@ -244,6 +281,15 @@ func (p *Polymarket) discover(ctx context.Context) error {
 
 	limit := 200
 	cursor := ""
+
+	type cand struct {
+		m   clobMarket
+		end time.Time
+		yes string
+		no  string
+	}
+	var best *cand
+
 	for page := 0; page < 30; page++ {
 		u := fmt.Sprintf("%s/markets?limit=%d", p.baseURL, limit)
 		if cursor != "" {
@@ -270,15 +316,15 @@ func (p *Polymarket) discover(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
+			// Must be future-dated to be considered the current tradable 15m market.
+			if time.Until(end) <= 0 {
+				continue
+			}
 
-			p.marketID = m.ConditionID
-			p.yesTokenID = yes
-			p.noTokenID = no
-			p.endDate = end
-			p.negRisk = m.NegRisk
-			p.minOrderSize = m.MinOrderSize
-			p.minTickSize = fmtTickSize(m.MinTickSize)
-			return nil
+			c := &cand{m: m, end: end, yes: yes, no: no}
+			if best == nil || c.end.Before(best.end) {
+				best = c
+			}
 		}
 
 		if resp.NextCursor == "" {
@@ -292,7 +338,18 @@ func (p *Polymarket) discover(ctx context.Context) error {
 		}
 	}
 
-	return fmt.Errorf("no matching market found (set POLY_MARKET_SLUG_REGEX or POLY_YES_TOKEN_ID/POLY_NO_TOKEN_ID/POLY_MARKET_ID)")
+	if best == nil {
+		return fmt.Errorf("no matching market found (set POLY_MARKET_SLUG_REGEX or POLY_YES_TOKEN_ID/POLY_NO_TOKEN_ID/POLY_MARKET_ID)")
+	}
+
+	p.marketID = best.m.ConditionID
+	p.yesTokenID = best.yes
+	p.noTokenID = best.no
+	p.endDate = best.end
+	p.negRisk = best.m.NegRisk
+	p.minOrderSize = best.m.MinOrderSize
+	p.minTickSize = fmtTickSize(best.m.MinTickSize)
+	return nil
 }
 
 type clobBook struct {

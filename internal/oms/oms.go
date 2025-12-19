@@ -204,11 +204,25 @@ func (o *OMS) OnIntent(ctx context.Context, in types.Intent, exec Execution) {
 }
 
 func (o *OMS) OnOrderUpdate(upd OrderUpdate) {
-	ord := o.orders[upd.ClientOrderID]
-	if ord == nil {
-		ord = &Order{ClientOrderID: upd.ClientOrderID, ExchangeOrderID: upd.ExchangeOrderID, State: StateUnknown}
-		o.orders[upd.ClientOrderID] = ord
+	// If update is keyed by exchange order id (common for Polymarket polling),
+	// try to find the local order by exchange id.
+	var ord *Order
+	if upd.ClientOrderID != "" {
+		ord = o.orders[upd.ClientOrderID]
+	} else if upd.ExchangeOrderID != "" {
+		for _, candidate := range o.orders {
+			if candidate.ExchangeOrderID == upd.ExchangeOrderID {
+				ord = candidate
+				break
+			}
+		}
 	}
+
+	// If still unknown, ignore; we only track orders created by this bot.
+	if ord == nil {
+		return
+	}
+
 	if upd.ExchangeOrderID != "" {
 		ord.ExchangeOrderID = upd.ExchangeOrderID
 	}
