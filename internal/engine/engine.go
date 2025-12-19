@@ -34,6 +34,8 @@ type Engine struct {
 
 	lastTick *types.MarketTick
 	lastRisk types.RiskState
+
+	currentMarketID string
 }
 
 type Config struct {
@@ -89,6 +91,38 @@ func (e *Engine) Run(ctx context.Context) error {
 
 func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 	switch ev.Type {
+	case types.EventMarketSnapshot:
+		snap, ok := ev.Payload.(types.MarketSnapshot)
+		if !ok {
+			e.log.Warn("bad payload type", "event", ev.Type)
+			return
+		}
+		// New cycle boundary: cancel outstanding orders and clear per-cycle state.
+		if snap.MarketID != "" && snap.MarketID != e.currentMarketID {
+			// Best-effort cancel before resetting.
+			if e.oms != nil && e.market != nil {
+				e.oms.CancelAll(ctx, e.market)
+			}
+			if e.oms != nil {
+				e.oms.Reset()
+			}
+			if e.pos != nil {
+				e.pos.Reset()
+			}
+			if e.signals != nil {
+				e.signals.Reset()
+			}
+			e.lastTick = nil
+			e.lastRisk = types.RiskState{Ts: time.Now().UTC()}
+			e.currentMarketID = snap.MarketID
+			e.log.Info("cycle switched",
+				"market_id", snap.MarketID,
+				"slug", snap.MarketSlug,
+				"cycle_start", snap.CycleStart.Format(time.RFC3339),
+				"end", snap.EndDate.Format(time.RFC3339),
+			)
+		}
+
 	case types.EventMarketTick:
 		tick, ok := ev.Payload.(types.MarketTick)
 		if !ok {

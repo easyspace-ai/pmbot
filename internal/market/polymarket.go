@@ -33,6 +33,7 @@ type Polymarket struct {
 	yesTokenID string
 	noTokenID  string
 	marketID   string
+	marketSlug string
 
 	// Polling
 	pollInterval time.Duration
@@ -133,9 +134,26 @@ func (p *Polymarket) Start(ctx context.Context, b *bus.Bus) error {
 		}
 	}
 
+	// Announce the current cycle context.
+	_ = b.Publish(ctx, types.Event{
+		Type: types.EventMarketSnapshot,
+		Payload: types.MarketSnapshot{
+			MarketID:      p.marketID,
+			MarketSlug:    p.marketSlug,
+			CycleStart:    cycleStartFromSlug(p.marketSlug),
+			EndDate:       p.endDate,
+			YesTokenID:    p.yesTokenID,
+			NoTokenID:     p.noTokenID,
+			MinTickSize:   p.minTickSizeFloat(),
+			MinOrderSize:  p.minOrderSize,
+			NegRisk:       p.negRisk,
+		},
+	})
+
 	p.log.Info("polymarket adapter ready",
 		"base", p.baseURL,
 		"market_id", p.marketID,
+		"market_slug", p.marketSlug,
 		"yes_token_id", p.yesTokenID,
 		"no_token_id", p.noTokenID,
 		"end_date", p.endDate.Format(time.RFC3339),
@@ -195,6 +213,22 @@ func (p *Polymarket) pollLoop(ctx context.Context, b *bus.Bus) {
 				// Reset L2 cursors after rotation.
 				p.ordersCursor = "MA=="
 				lastGood = time.Time{}
+
+				// Announce the new cycle so Engine can reset per-cycle state.
+				_ = b.Publish(ctx, types.Event{
+					Type: types.EventMarketSnapshot,
+					Payload: types.MarketSnapshot{
+						MarketID:      p.marketID,
+						MarketSlug:    p.marketSlug,
+						CycleStart:    cycleStartFromSlug(p.marketSlug),
+						EndDate:       p.endDate,
+						YesTokenID:    p.yesTokenID,
+						NoTokenID:     p.noTokenID,
+						MinTickSize:   p.minTickSizeFloat(),
+						MinOrderSize:  p.minOrderSize,
+						NegRisk:       p.negRisk,
+					},
+				})
 			}
 
 			bestBid, bestAsk, ts, err := p.getBestBidAsk(ctx, p.yesTokenID)
@@ -349,6 +383,7 @@ func (p *Polymarket) discover(ctx context.Context) error {
 	p.marketID = best.m.ConditionID
 	p.yesTokenID = best.yes
 	p.noTokenID = best.no
+	p.marketSlug = best.m.MarketSlug
 	p.endDate = best.end
 	p.negRisk = best.m.NegRisk
 	p.minOrderSize = best.m.MinOrderSize

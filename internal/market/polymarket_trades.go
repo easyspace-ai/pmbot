@@ -40,6 +40,7 @@ func (p *Polymarket) pollTradesLoop(ctx context.Context, b *bus.Bus) {
 
 	cursor := "MA=="
 	seen := make(map[string]struct{}, 4096)
+	lastMarket := p.marketID
 
 	for {
 		select {
@@ -48,6 +49,12 @@ func (p *Polymarket) pollTradesLoop(ctx context.Context, b *bus.Bus) {
 		case <-ticker.C:
 			if p.apiCreds == nil {
 				continue
+			}
+			// If market rotated, reset cursor+dedup for the new cycle.
+			if p.marketID != "" && p.marketID != lastMarket {
+				cursor = "MA=="
+				seen = make(map[string]struct{}, 4096)
+				lastMarket = p.marketID
 			}
 			next, err := p.pullTradesOnce(ctx, b, cursor, seen)
 			if err != nil {

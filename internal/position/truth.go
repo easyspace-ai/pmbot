@@ -29,6 +29,19 @@ func New() *Truth {
 	return &Truth{confidence: 0.0}
 }
 
+// Reset clears per-cycle position state.
+func (t *Truth) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.marketID = ""
+	t.yesShares = 0
+	t.noShares = 0
+	t.cash = 0
+	t.confidence = 0
+	t.updatedAt = time.Now().UTC()
+	t.lastRisk = types.RiskState{}
+}
+
 func (t *Truth) OnOrderUpdate(upd oms.OrderUpdate) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

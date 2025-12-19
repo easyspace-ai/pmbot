@@ -112,6 +112,22 @@ func New() *OMS {
 	return &OMS{orders: map[string]*Order{}}
 }
 
+// Reset clears all per-cycle state. Call when a new 15m cycle starts.
+// NOTE: Engine should attempt to cancel outstanding orders before calling Reset.
+func (o *OMS) Reset() {
+	o.lastRisk = types.RiskState{}
+	o.orders = map[string]*Order{}
+	o.lastTick = nil
+}
+
+// OrderCount returns the number of locally tracked orders (for diagnostics/tests).
+func (o *OMS) OrderCount() int { return len(o.orders) }
+
+// CancelAll attempts to cancel all open orders (best-effort).
+func (o *OMS) CancelAll(ctx context.Context, exec Execution) {
+	o.cancelAllOpen(ctx, exec)
+}
+
 func (o *OMS) OnRisk(ctx context.Context, r types.RiskState, exec Execution) {
 	o.lastRisk = r
 	if r.KillSwitch {

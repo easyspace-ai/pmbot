@@ -23,6 +23,16 @@ func New() *Layer {
 	return &Layer{Alpha: 0.2}
 }
 
+// Reset clears per-cycle signal state.
+func (l *Layer) Reset() {
+	l.lastP = 0
+	l.lastTs = time.Time{}
+	l.lastVel = 0
+	l.velEWMA = 0
+	l.accEWMA = 0
+	l.hasInitial = false
+}
+
 func (l *Layer) OnTick(t types.MarketTick) {
 	p := clamp01(t.PYes)
 	ts := time.Now().UTC()

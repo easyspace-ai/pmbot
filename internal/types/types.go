@@ -80,6 +80,24 @@ type MarketTick struct {
 	DataQuality float64
 }
 
+// MarketSnapshot announces a new trading cycle/market context.
+// Engine uses it as a hard boundary: reset per-cycle state (orders/positions/signals).
+type MarketSnapshot struct {
+	MarketID string
+	MarketSlug string
+
+	// CycleStart is derived from the slug timestamp when applicable.
+	CycleStart time.Time
+	EndDate    time.Time
+
+	YesTokenID string
+	NoTokenID  string
+
+	MinTickSize  float64
+	MinOrderSize float64
+	NegRisk      bool
+}
+
 // Intent is the controller output.
 // It expresses *intention* rather than concrete orders.
 type Intent struct {
