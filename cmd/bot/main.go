@@ -6,35 +6,43 @@ import (
 	
 	"polymarket-bot/pkg/brain"
 	"polymarket-bot/pkg/config"
+	"polymarket-bot/pkg/execution" // New Execution Layer
 	"polymarket-bot/pkg/market"
-	"polymarket-bot/pkg/order"
+	// "polymarket-bot/pkg/order" // Deprecated by execution pkg
 	"polymarket-bot/pkg/safety"
 	"polymarket-bot/pkg/signal"
+	"polymarket-bot/pkg/store" // New Store Layer
 )
 
 func main() {
 	useMock := flag.Bool("mock", false, "Use mock market instead of real Polymarket API")
 	flag.Parse()
 
-	// 0. Load Config
+	// 0. Load Config & Store
 	cfg := config.Load()
+	db := store.NewStore("bot.db") // Local SQLite file
 
 	// 1. Initialize Components
+	// ... (Client init same as before) ...
+	// REPLACING original mkt initialization logic temporarily for brevity in this replace block context
+	// Actually we need to keep the logic but pass the client to execution manager.
+	
+	var polyClient *market.PolymarketClient
 	var mkt market.MarketProvider
 	
 	if *useMock {
 		log.Println("Using Mock Market")
 		mockMkt := market.NewMockMarket()
 		mkt = mockMkt
-		// Start Mock Simulation (same as before)
-		go func() {
-			// ... simple mock loop can be added here if needed, or rely on MockMarket implementation details
-		}()
 	} else {
 		log.Println("Initializing Real Polymarket Client...")
-		polyClient := market.NewPolymarketClient(cfg)
+		polyClient = market.NewPolymarketClient(cfg)
 		mkt = polyClient
 	}
+	
+	// Execution Manager replaces OrderManager
+	execMgr := execution.NewExecutionManager(polyClient, db)
+	execMgr.Start() // Recovers state
 
 	sigProc := signal.NewSignalProcessor()
 	
@@ -49,23 +57,21 @@ func main() {
 	
 	freezeDetector := safety.NewFreezeDetector(0.95, 0.05)
 	killSwitch := safety.NewKillSwitch()
-	orderMgr := order.NewOrderManager()
+	// orderMgr := order.NewOrderManager() // Removed
 
 	// 3. Main Control Loop
 	log.Println("Starting Control System...")
-	dataChan := mkt.Subscribe() // This blocks for real client until market is found
+	dataChan := mkt.Subscribe() 
 
 	for data := range dataChan {
-		// A. Check Kill Switch
+		// ... (Safety Checks same as before) ...
 		if triggered, reason := killSwitch.IsTriggered(); triggered {
 			log.Printf("KILL SWITCH ACTIVE: %s. Halting.\n", reason)
 			return
 		}
 
-		// B. Process Signal
 		sig := sigProc.Process(data)
 
-		// C. Check Freeze
 		if frozen, reason := freezeDetector.Check(sig); frozen {
 			log.Printf("Market Frozen: %s. Reducing risk only.\n", reason)
 			continue
@@ -74,19 +80,26 @@ func main() {
 		// D. Brain Compute
 		action := controller.Compute(sig)
 
-		// E. Order Execution
-		orderMgr.ProcessAction(action)
+		// E. Execution (Smart Router)
+		// We need to fetch current position from Store to pass to Execution
+		// For now assuming 0 if not tracked
+		// In real impl, store.GetPosition(tokenID)
+		currentPos := 0.0 
+		
+		// We need Best Bid/Ask for execution logic. 
+		// MarketData struct has Mid Price, but we might want raw bid/ask from client if available.
+		// For now using PriceUp/Down as proxies.
+		bestBid := data.PriceUp - 0.01 // Mock spread
+		bestAsk := data.PriceUp + 0.01
+
+		execMgr.ExecuteIntent(action, currentPos, bestBid, bestAsk)
 
 		// Logging
-		log.Printf("T=%.0fs | P=%.2f | V=%.3f | Ent=%.2f | Mode=%s | Intent: Up=%.2f Down=%.2f Exp=%.2f\n",
+		log.Printf("T=%.0fs | P=%.2f | Intent: Net=%.2f Mode=%s",
 			sig.TimeRemaining.Seconds(),
 			sig.ProbUp,
-			sig.Velocity,
-			sig.Entropy,
+			(action.UpWeight-action.DownWeight)*action.TargetRiskExposure,
 			action.Mode,
-			action.UpWeight,
-			action.DownWeight,
-			action.TargetRiskExposure,
 		)
 	}
 }

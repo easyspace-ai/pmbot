@@ -2,6 +2,15 @@ package types
 
 import "time"
 
+// Added OrderUpdate struct
+type OrderUpdate struct {
+	OrderID     string
+	Status      string
+	FilledSize  float64
+	Timestamp   time.Time
+}
+
+// Existing structs...
 // MarketData represents the raw market data from Polymarket
 type MarketData struct {
 	Timestamp     time.Time
@@ -44,7 +53,7 @@ const (
 // OrderRequest represents a request to the Order State Machine
 type OrderRequest struct {
 	ID        string
-	Side      string // "UP" or "DOWN"
+	Side      string // "UP" or "DOWN" (or "BUY"/"SELL")
 	Amount    float64
 	LimitPrice float64
 	Timestamp time.Time
