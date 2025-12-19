@@ -5,6 +5,7 @@ import (
 	"log"
 	
 	"polymarket-bot/pkg/brain"
+	"polymarket-bot/pkg/config"
 	"polymarket-bot/pkg/market"
 	"polymarket-bot/pkg/order"
 	"polymarket-bot/pkg/safety"
@@ -14,6 +15,9 @@ import (
 func main() {
 	useMock := flag.Bool("mock", false, "Use mock market instead of real Polymarket API")
 	flag.Parse()
+
+	// 0. Load Config
+	cfg := config.Load()
 
 	// 1. Initialize Components
 	var mkt market.MarketProvider
@@ -28,7 +32,7 @@ func main() {
 		}()
 	} else {
 		log.Println("Initializing Real Polymarket Client...")
-		polyClient := market.NewPolymarketClient()
+		polyClient := market.NewPolymarketClient(cfg)
 		mkt = polyClient
 	}
 
