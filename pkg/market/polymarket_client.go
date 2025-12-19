@@ -25,6 +25,7 @@ const (
 type PolymarketClient struct {
 	config      *config.Config
 	signer      *Signer
+	nonceMgr    *NonceManager // Add NonceManager
 	dataCh      chan types.MarketData
 	stopCh      chan struct{}
 	activeToken string // The Token ID we are currently tracking (usually the YES token)
@@ -38,13 +39,24 @@ type PolymarketClient struct {
 
 func NewPolymarketClient(cfg *config.Config) *PolymarketClient {
 	var signer *Signer
+	var nonceMgr *NonceManager
+	
 	if cfg.PrivateKey != "" {
 		signer = NewSigner(cfg.PrivateKey, cfg.ApiKey, cfg.ApiSecret, cfg.ApiPassphrase, cfg.ChainID, cfg.ExchangeAddr)
+		
+		// Initialize Nonce Manager
+		var err error
+		nonceMgr, err = NewNonceManager(cfg.PolygonRpcUrl, cfg.Address)
+		if err != nil {
+			// Log error but don't crash, maybe we are in mock mode or read-only
+			fmt.Printf("Warning: Failed to connect to Polygon RPC: %v\n", err)
+		}
 	}
 
 	return &PolymarketClient{
 		config:      cfg,
 		signer:      signer,
+		nonceMgr:    nonceMgr,
 		dataCh:      make(chan types.MarketData, 100),
 		stopCh:      make(chan struct{}),
 		currentBids: make(map[float64]float64),
@@ -145,7 +157,27 @@ func (c *PolymarketClient) SubmitOrder(order types.OrderRequest) error {
 	// We need a unique salt/nonce
 	salt := big.NewInt(time.Now().UnixNano())
 	
-	// Expiration: 5 mins from now?
+	// Use NonceManager if available, otherwise 0 (API might handle it if Nonce field is for EIP712 Salt?)
+	// Actually, in CTF Exchange, `nonce` is a field in the order struct, but often used for cancellation matching
+	// OR it maps to the Maker's nonce on the contract. 
+	// For EIP-712 orders on 0x/Polymarket, the "nonce" field is usually an arbitrary number for uniqueness (Salt covers this too) 
+	// OR a true protocol nonce.
+	// Documentation says: "nonce" is "A unique number for the order". 
+	// Ideally we use a counter.
+	
+	var orderNonce *big.Int
+	if c.nonceMgr != nil {
+		n, err := c.nonceMgr.GetNextNonce()
+		if err == nil {
+			orderNonce = new(big.Int).SetUint64(n)
+		} else {
+			orderNonce = big.NewInt(0)
+		}
+	} else {
+		orderNonce = big.NewInt(0)
+	}
+	
+	// Expiration: 5 mins from now
 	exp := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
 
 	eip712Order := OrderStruct{
@@ -154,10 +186,10 @@ func (c *PolymarketClient) SubmitOrder(order types.OrderRequest) error {
 		Signer:      common.HexToAddress(c.config.Address),
 		Taker:       common.HexToAddress("0x0000000000000000000000000000000000000000"), // Open order
 		TokenId:     new(big.Int), // Set Active Token ID
-		MakerAmount: amountInt,    // This depends on side/price. Simplified.
-		TakerAmount: amountInt,    // Simplified. Price = Maker/Taker ratio?
+		MakerAmount: amountInt,    
+		TakerAmount: amountInt, // Simplified logic
 		Expiration:  exp,
-		Nonce:       big.NewInt(0),
+		Nonce:       orderNonce,
 		FeeRate:     big.NewInt(0),
 		Side:        side,
 		SideType:    0,

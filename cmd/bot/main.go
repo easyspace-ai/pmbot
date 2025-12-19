@@ -40,8 +40,15 @@ func main() {
 		mkt = polyClient
 	}
 	
-	// Execution Manager replaces OrderManager
-	execMgr := execution.NewExecutionManager(polyClient, db)
+	// Execution Manager
+	riskConfig := safety.RiskConfig{
+		MaxDrawdownDaily: 0.05,
+		MaxPositionSize:  500.0, // Conservative start
+		MaxSlippage:      0.02,
+	}
+	riskMgr := safety.NewRiskManager(riskConfig)
+	
+	execMgr := execution.NewExecutionManager(polyClient, db, riskMgr)
 	execMgr.Start() // Recovers state
 
 	sigProc := signal.NewSignalProcessor()
@@ -82,14 +89,17 @@ func main() {
 
 		// E. Execution (Smart Router)
 		// We need to fetch current position from Store to pass to Execution
-		// For now assuming 0 if not tracked
-		// In real impl, store.GetPosition(tokenID)
-		currentPos := 0.0 
+		// Assuming we track "Active Token" position
+		// In real impl, we'd query by polyClient.ActiveToken()
+		currentPos := 0.0
+		// Fetch actual pos from DB
+		// amount, _, _ := db.GetPosition(polyClient.ActiveToken())
+		// currentPos = amount
 		
 		// We need Best Bid/Ask for execution logic. 
 		// MarketData struct has Mid Price, but we might want raw bid/ask from client if available.
 		// For now using PriceUp/Down as proxies.
-		bestBid := data.PriceUp - 0.01 // Mock spread
+		bestBid := data.PriceUp - 0.01 // Mock spread if running in mock mode
 		bestAsk := data.PriceUp + 0.01
 
 		execMgr.ExecuteIntent(action, currentPos, bestBid, bestAsk)

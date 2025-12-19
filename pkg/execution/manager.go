@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"polymarket-bot/pkg/market"
+	"polymarket-bot/pkg/safety" // Add import
 	"polymarket-bot/pkg/store"
 	"polymarket-bot/pkg/types"
 )
@@ -14,6 +15,7 @@ import (
 type ExecutionManager struct {
 	client *market.PolymarketClient
 	store  *store.Store
+	risk   *safety.RiskManager // Add RiskManager
 	
 	// Local Cache of Nonce to prevent collisions
 	nonceMu sync.Mutex
@@ -23,10 +25,11 @@ type ExecutionManager struct {
 	orderUpdateCh chan types.OrderUpdate // From WS
 }
 
-func NewExecutionManager(client *market.PolymarketClient, db *store.Store) *ExecutionManager {
+func NewExecutionManager(client *market.PolymarketClient, db *store.Store, risk *safety.RiskManager) *ExecutionManager {
 	return &ExecutionManager{
 		client:        client,
 		store:         db,
+		risk:          risk,
 		orderUpdateCh: make(chan types.OrderUpdate, 100),
 	}
 }
@@ -71,7 +74,14 @@ func (em *ExecutionManager) ExecuteIntent(action types.ControlAction, currentPos
 
 	log.Printf("EXEC: Curr=%.0f, Target=%.0f, Diff=%.0f, Mode=%s", currentPos, netTargetShares, diff, action.Mode)
 
-	// 2. Execution Strategy
+	// 2. Risk Check
+	err := em.risk.CheckTrade(string(action.Mode), diff, price, bestBid, bestAsk)
+	if err != nil {
+		log.Printf("RISK REJECT: %v", err)
+		return
+	}
+
+	// 3. Execution Strategy
 	if action.Mode == types.ModeShock {
 		// TAKER STRATEGY: Immediate execution
 		side := "BUY"
