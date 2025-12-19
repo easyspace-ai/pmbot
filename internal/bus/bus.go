@@ -1,4 +1,4 @@
-package engine
+package bus
 
 import (
 	"context"
@@ -25,10 +25,10 @@ type Bus struct {
 	closed bool
 }
 
-// NewBus creates a bus with a bounded internal buffer.
+// New creates a bus with a bounded internal buffer.
 // When the buffer is full, Publish will block until space becomes available
 // or ctx is done.
-func NewBus(buffer int) *Bus {
+func New(buffer int) *Bus {
 	if buffer <= 0 {
 		buffer = 1
 	}

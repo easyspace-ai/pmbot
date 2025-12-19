@@ -56,7 +56,7 @@ func Entropy(p float64) float64 {
 	return -(p*math.Log(p) + (1-p)*math.Log(1-p))
 }
 
-func (l *Layer) Velocity() float64 { return l.velEWMA }
+func (l *Layer) Velocity() float64     { return l.velEWMA }
 func (l *Layer) Acceleration() float64 { return l.accEWMA }
 
 func ewma(prev, x, alpha float64) float64 {

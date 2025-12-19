@@ -6,7 +6,7 @@ import (
 	"math"
 	"time"
 
-	"polymarket-btc-bot/internal/engine"
+	"polymarket-btc-bot/internal/bus"
 	"polymarket-btc-bot/internal/oms"
 	"polymarket-btc-bot/internal/types"
 )
@@ -29,7 +29,7 @@ func NewDummy(dur time.Duration, log *slog.Logger) *Dummy {
 	return &Dummy{dur: dur, log: log}
 }
 
-func (d *Dummy) Start(ctx context.Context, bus *engine.Bus) error {
+func (d *Dummy) Start(ctx context.Context, bus *bus.Bus) error {
 	d.start = time.Now().UTC()
 
 	go func() {
@@ -59,12 +59,12 @@ func (d *Dummy) Start(ctx context.Context, bus *engine.Bus) error {
 				_ = bus.Publish(ctx, types.Event{
 					Type: types.EventMarketTick,
 					Payload: types.MarketTick{
-						MarketID:       "DUMMY-BTC-15M",
-						PYes:           p,
-						BestBid:        p - 0.01,
-						BestAsk:        p + 0.01,
-						TimeRemaining:  rem,
-						DataQuality:    0.95,
+						MarketID:      "DUMMY-BTC-15M",
+						PYes:          p,
+						BestBid:       p - 0.01,
+						BestAsk:       p + 0.01,
+						TimeRemaining: rem,
+						DataQuality:   0.95,
 					},
 				})
 

@@ -3,7 +3,7 @@ package market
 import (
 	"context"
 
-	"polymarket-btc-bot/internal/engine"
+	"polymarket-btc-bot/internal/bus"
 	"polymarket-btc-bot/internal/oms"
 )
 
@@ -11,7 +11,7 @@ import (
 // It is responsible for emitting market/ack/fill events into the bus,
 // and for executing order requests from OMS.
 type Adapter interface {
-	Start(ctx context.Context, bus *engine.Bus) error
+	Start(ctx context.Context, bus *bus.Bus) error
 
 	// Execution methods called by OMS.
 	PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) (oms.PlaceOrderResult, error)

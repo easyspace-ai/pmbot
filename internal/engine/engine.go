@@ -7,6 +7,7 @@ import (
 
 	"polymarket-btc-bot/internal/audit"
 	"polymarket-btc-bot/internal/brain"
+	"polymarket-btc-bot/internal/bus"
 	"polymarket-btc-bot/internal/market"
 	"polymarket-btc-bot/internal/oms"
 	"polymarket-btc-bot/internal/position"
@@ -20,7 +21,7 @@ import (
 type Engine struct {
 	log *slog.Logger
 
-	bus   *Bus
+	bus   *bus.Bus
 	audit audit.Sink
 
 	market market.Adapter
@@ -47,20 +48,20 @@ func New(log *slog.Logger, cfg Config, a market.Adapter, s *signal.Layer, b *bra
 		sink = audit.NopSink{}
 	}
 	return &Engine{
-		log:    log,
-		bus:    NewBus(cfg.BusBuffer),
-		audit:  sink,
-		market: a,
-		signals: s,
-		brain:   b,
-		risk:    r,
-		oms:     o,
-		pos:     p,
+		log:      log,
+		bus:      bus.New(cfg.BusBuffer),
+		audit:    sink,
+		market:   a,
+		signals:  s,
+		brain:    b,
+		risk:     r,
+		oms:      o,
+		pos:      p,
 		lastRisk: types.RiskState{Ts: time.Now().UTC()},
 	}
 }
 
-func (e *Engine) Bus() *Bus { return e.bus }
+func (e *Engine) Bus() *bus.Bus { return e.bus }
 
 func (e *Engine) Run(ctx context.Context) error {
 	// Start market adapter (WS/REST etc) to publish events.
@@ -96,6 +97,10 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 		}
 		e.lastTick = &tick
 
+		if e.oms != nil {
+			e.oms.OnTick(tick)
+		}
+
 		if e.signals != nil {
 			e.signals.OnTick(tick)
 		}
@@ -108,7 +113,7 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 		// If kill-switch is active, OMS must not create new exposure.
 		if e.lastRisk.KillSwitch {
 			if e.oms != nil {
-				e.oms.OnRisk(e.lastRisk)
+				e.oms.OnRisk(ctx, e.lastRisk, e.market)
 			}
 			return
 		}
@@ -156,7 +161,7 @@ func (e *Engine) handleEvent(ctx context.Context, ev types.Event) {
 		}
 		e.lastRisk = rs
 		if e.oms != nil {
-			e.oms.OnRisk(rs)
+			e.oms.OnRisk(ctx, rs, e.market)
 		}
 	}
 }

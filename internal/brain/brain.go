@@ -18,9 +18,9 @@ type Controller struct {
 	TimeHalfLife time.Duration
 
 	// Freeze thresholds.
-	FreezeP        float64
-	FreezeEntropy  float64
-	FreezeMinTime  time.Duration
+	FreezeP       float64
+	FreezeEntropy float64
+	FreezeMinTime time.Duration
 }
 
 func New() *Controller {
@@ -57,7 +57,7 @@ func (c *Controller) Decide(t types.MarketTick, s *signal.Layer, r types.RiskSta
 	// Bias: mean-reversion to 0.5 during high entropy; follow consensus during low entropy.
 	// This is a placeholder that matches the design intent (continuous control),
 	// and will be replaced by the tuned dual-channel controller.
-	consensus := 2*(p-0.5) // [-1,1]
+	consensus := 2 * (p - 0.5) // [-1,1]
 	anti := -consensus
 	w := clamp01(H / 0.6931471805599453) // normalize by max entropy at p=0.5
 	bias := w*anti + (1-w)*consensus
@@ -75,12 +75,12 @@ func (c *Controller) Decide(t types.MarketTick, s *signal.Layer, r types.RiskSta
 	}
 
 	return types.Intent{
-		MarketID:      t.MarketID,
-		BiasYes:       clamp11(bias),
-		RiskDeltaMax:  riskDelta,
-		ModeMix:       modeMix,
-		Freeze:        freeze,
-		Ts:            time.Now().UTC(),
+		MarketID:     t.MarketID,
+		BiasYes:      clamp11(bias),
+		RiskDeltaMax: riskDelta,
+		ModeMix:      modeMix,
+		Freeze:       freeze,
+		Ts:           time.Now().UTC(),
 	}
 }
 
