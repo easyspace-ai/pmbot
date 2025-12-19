@@ -24,8 +24,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Placeholder adapter until Polymarket API integration is added.
-	adapter := market.NewDummy(15*time.Minute, log)
+	var adapter market.Adapter
+	if os.Getenv("POLY_ADAPTER") == "polymarket" {
+		adapter = market.NewPolymarketFromEnv(log)
+	} else {
+		// Default to dummy so the project runs out-of-box.
+		adapter = market.NewDummy(15*time.Minute, log)
+	}
 
 	en := engine.New(
 		log,
