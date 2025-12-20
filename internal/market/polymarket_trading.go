@@ -268,11 +268,11 @@ func (p *Polymarket) checkAndMerge(ctx context.Context) {
 		return
 	}
 
-	// 最小合并阈值 (5.0 USDC) - 提高阈值以确保 Gas 费占比低
-	const minMergeThreshold = 5.0
+	// 最小合并阈值 (使用配置值)
+	minMergeThreshold := p.minMergeThreshold
 	
 	// 简单的 Gas 保护：如果余额太小，不值得花 Gas
-	// 注意：这里没有动态查询 Gas Price，而是使用了保守的阈值
+	// 如果 minMergeThreshold <= 0，则禁用保护
 	if mergeableAmount < minMergeThreshold {
 		return
 	}

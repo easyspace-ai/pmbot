@@ -60,6 +60,9 @@ type Polymarket struct {
 	apiCreds       *apiCreds
 	clobClient     *clobclient.Client // CLOB客户端
 	ctfClient      *clobclient.CTFClient // CTF合约客户端
+	
+	// AutoMerge threshold
+	minMergeThreshold float64
 
 	// L2 polling cursors/dedup
 	ordersCursor string
@@ -83,6 +86,9 @@ type PolymarketConfig struct {
 	APIKey        string
 	APISecret     string
 	APIPassphrase string
+
+	// AutoMerge threshold
+	MinMergeThreshold float64
 }
 
 func NewPolymarketFromEnv(log *logrus.Logger) *Polymarket {
@@ -103,8 +109,22 @@ func NewPolymarketFromEnv(log *logrus.Logger) *Polymarket {
 		APIKey:        os.Getenv("POLY_API_KEY"),
 		APISecret:     os.Getenv("POLY_API_SECRET"),
 		APIPassphrase: os.Getenv("POLY_API_PASSPHRASE"),
+		
+		// 默认为 1.0 USDC，可以通过环境变量设置为 0
+		MinMergeThreshold: parseFloat64Default(os.Getenv("POLY_MIN_MERGE_THRESHOLD"), 1.0),
 	}
 	return NewPolymarket(log, cfg)
+}
+
+func parseFloat64Default(s string, def float64) float64 {
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return def
+	}
+	return v
 }
 
 func NewPolymarket(log *logrus.Logger, cfg PolymarketConfig) *Polymarket {
@@ -131,6 +151,7 @@ func NewPolymarket(log *logrus.Logger, cfg PolymarketConfig) *Polymarket {
 		funder:         cfg.Funder,
 		signatureType:  cfg.SignatureType,
 		apiCreds:       newApiCredsFromEnv(cfg.APIKey, cfg.APISecret, cfg.APIPassphrase),
+		minMergeThreshold: cfg.MinMergeThreshold,
 	}
 }
 
