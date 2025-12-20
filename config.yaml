@@ -14,9 +14,9 @@ strategies:
   enabled:
     - "simple_threshold"  # 简单阈值策略：价格 >= 60 分买入，+3 分自动卖出
   simple_threshold:
-    buy_threshold: 0.60  # 买入阈值（0.60 = 60分）
-    profit_target: 0.03  # 止盈目标（0.03 = 3分）
-    order_size: 10.0     # 订单大小
+    buy_threshold: 0.65  # 买入阈值（0.60 = 60分）
+    profit_target: 0.05  # 止盈目标（0.03 = 3分）
+    order_size: 4.0     # 订单大小
 
 # 日志配置
 log_level: "debug"      # debug, info, warn, error
@@ -27,18 +27,12 @@ log_by_cycle: true     # 是否按周期命名日志文件
 polymarket:
   # 基础配置
   base_url: "https://clob.polymarket.com"
-  market_slug_regex: "^btc-updown-15m-\\d+$"  # 市场 slug 正则表达式
-  
-  # 市场信息（可选，如果不设置会自动发现）
-  market_id: ""
-  yes_token_id: ""
-  no_token_id: ""
   
   # 轮询间隔（仅在 use_websocket=false 时使用）
   poll_interval: "300ms"
   
   # 交易配置
-  trading_enabled: false
+  trading_enabled: true
   chain_id: 137
   signature_type: 0
   
