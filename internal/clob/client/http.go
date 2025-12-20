@@ -187,7 +187,8 @@ func parseResponse(resp *http.Response, result interface{}) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(reader)
 		errorMsg := fmt.Sprintf("HTTP 错误 %d: %s", resp.StatusCode, string(bodyBytes))
-		return fmt.Errorf(errorMsg)
+		// go vet: fmt.Errorf expects a format string; wrap as "%s".
+		return fmt.Errorf("%s", errorMsg)
 	}
 
 	if result != nil {

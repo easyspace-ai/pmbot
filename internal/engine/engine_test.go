@@ -45,13 +45,16 @@ func TestEngine_MarketSnapshot_ResetsCycleState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
+	log := logrus.New()
+	log.SetOutput(io.Discard)
 	adapter := silentAdapter{}
 	om := oms.New()
+	om.SetLogger(log)
 	pos := position.New()
 	sig := signal.New()
 
 	en := New(
-		logrus.New(),
+		log,
 		Config{BusBuffer: 128},
 		adapter,
 		sig,
@@ -64,7 +67,15 @@ func TestEngine_MarketSnapshot_ResetsCycleState(t *testing.T) {
 
 	// Seed some per-cycle state.
 	om.OnTick(types.MarketTick{MarketID: "OLD", PYes: 0.5, BestAsk: 0.51})
-	om.OnIntent(ctx, types.Intent{MarketID: "OLD", BiasYes: 1, RiskDeltaMax: 1, ModeMix: 1, Freeze: false, Ts: time.Now().UTC()}, adapter)
+	om.OnIntent(ctx,
+		types.Intent{MarketID: "OLD", BiasYes: 1, RiskDeltaMax: 1, ModeMix: 1, Freeze: false, Ts: time.Now().UTC()},
+		struct {
+			YesShares  float64
+			NoShares   float64
+			Confidence float64
+		}{},
+		adapter,
+	)
 	if om.OrderCount() == 0 {
 		t.Fatalf("expected OMS to have at least one order before reset")
 	}
@@ -91,8 +102,13 @@ func TestEngine_MarketSnapshot_ResetsCycleState(t *testing.T) {
 		t.Fatalf("expected OMS orders cleared")
 	}
 	yes, no, _, conf, _ := pos.Snapshot()
-	if yes != 0 || no != 0 || conf != 0 {
-		t.Fatalf("expected position cleared, got yes=%v no=%v conf=%v", yes, no, conf)
+	if yes != 0 || no != 0 {
+		t.Fatalf("expected position cleared, got yes=%v no=%v", yes, no)
+	}
+	// position.Truth.Reset() 会保留 confidence >= 0.7（模拟模式允许交易），
+	// 因此这里不再断言 conf == 0。
+	if conf < 0.7 {
+		t.Fatalf("expected confidence >= 0.7 after reset, got conf=%v", conf)
 	}
 	// Signals should have been reset at least once during transition.
 	// (Ignore later ticks since this test uses no market feed.)

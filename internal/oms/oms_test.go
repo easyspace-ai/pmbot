@@ -36,7 +36,8 @@ func TestOMS_KillSwitch_CancelsOpen(t *testing.T) {
 	o := New()
 	o.orders["c1"] = &Order{ClientOrderID: "c1", ExchangeOrderID: "e1", MarketID: "M", Side: types.SideYes, Price: 0.5, Size: 1, State: StateAck, CreatedAt: time.Now().UTC()}
 	o.OnRisk(context.Background(), types.RiskState{KillSwitch: true}, fakeExec{})
-	if o.orders["c1"].State != StateCanceling {
-		t.Fatalf("expected canceling, got %s", o.orders["c1"].State)
+	// CancelOrder 成功时会立即把本地状态标记为 CANCELED（不等待异步回报）。
+	if o.orders["c1"].State != StateCanceled {
+		t.Fatalf("expected canceled, got %s", o.orders["c1"].State)
 	}
 }
