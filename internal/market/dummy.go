@@ -3,6 +3,7 @@ package market
 import (
 	"context"
 	"math"
+	"math/rand"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -36,6 +37,8 @@ func (d *Dummy) Start(ctx context.Context, bus *bus.Bus) error {
 	go func() {
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -57,13 +60,33 @@ func (d *Dummy) Start(ctx context.Context, bus *bus.Bus) error {
 					p = 0.99
 				}
 
+				// Generate YES side prices
+				bidYes := p - 0.01
+				askYes := p + 0.01
+
+				// Generate NO side prices
+				pNo := 1.0 - p
+				bidNo := pNo - 0.01
+				askNo := pNo + 0.01
+
+				// Randomly inject arbitrage opportunity (10% chance)
+				// Reduce asks so that askYes + askNo < 1.0
+				if rng.Float64() < 0.10 {
+					discount := 0.03 // Create 3 cent arbitrage
+					askYes -= discount/2
+					askNo -= discount/2
+					d.log.Debug("Injecting arbitrage opportunity!")
+				}
+
 				_ = bus.Publish(ctx, types.Event{
 					Type: types.EventMarketTick,
 					Payload: types.MarketTick{
 						MarketID:      "DUMMY-BTC-15M",
 						PYes:          p,
-						BestBid:       p - 0.01,
-						BestAsk:       p + 0.01,
+						BestBid:       bidYes,
+						BestAsk:       askYes,
+						BestBidNo:     bidNo,
+						BestAskNo:     askNo,
 						TimeRemaining: rem,
 						DataQuality:   0.95,
 					},

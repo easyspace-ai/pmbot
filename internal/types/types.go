@@ -70,9 +70,15 @@ type MarketTick struct {
 
 	PYes float64
 
-	// Best bid/ask in probability-space (0..1). Optional.
+	// Best bid/ask in probability-space (0..1).
+	// These correspond to the YES token.
 	BestBid float64
 	BestAsk float64
+
+	// Best bid/ask for the NO token (0..1).
+	// Crucial for arbitrage strategies.
+	BestBidNo float64
+	BestAskNo float64
 
 	TimeRemaining time.Duration
 
