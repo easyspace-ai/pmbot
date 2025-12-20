@@ -1,0 +1,53 @@
+# PMBot 配置文件示例
+# 支持 YAML 和 JSON 格式
+
+# 钱包配置（敏感信息建议使用环境变量）
+wallet:
+  private_key: ""      # 从环境变量 POLY_PRIVATE_KEY 读取
+  funder_address: ""    # 从环境变量 POLY_FUNDER 读取
+
+# 代理配置
+proxy:
+  host: "127.0.0.1"
+  port: 15236
+
+# 策略配置
+strategies:
+  enabled:
+    - "simple"  # 启用的策略列表（当前支持：simple，可扩展）
+
+# 日志配置
+log_level: "info"      # debug, info, warn, error
+log_file: "logs/combined.log"
+log_by_cycle: true     # 是否按周期命名日志文件
+
+# Polymarket 配置
+polymarket:
+  # 基础配置
+  base_url: "https://clob.polymarket.com"
+  market_slug_regex: "^btc-updown-15m-\\d+$"  # 市场 slug 正则表达式
+  
+  # 市场信息（可选，如果不设置会自动发现）
+  market_id: ""
+  yes_token_id: ""
+  no_token_id: ""
+  
+  # 轮询间隔（仅在 use_websocket=false 时使用）
+  poll_interval: "300ms"
+  
+  # 交易配置
+  trading_enabled: false
+  chain_id: 137
+  private_key: ""      # 从环境变量读取
+  funder: ""           # 从环境变量读取
+  signature_type: 0
+  
+  # API 凭证（可选）
+  api_key: ""
+  api_secret: ""
+  api_passphrase: ""
+  
+  # WebSocket 配置
+  use_websocket: true  # 是否使用 WebSocket 实时数据（推荐）
+  websocket_proxy: ""  # WebSocket 代理 URL（可选，默认使用 proxy 配置）
+

@@ -3,9 +3,10 @@ package engine
 import (
 	"context"
 	"io"
-	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"polymarket-btc-bot/internal/audit"
 	"polymarket-btc-bot/internal/brain"
@@ -22,9 +23,11 @@ func TestEngine_Run_Dummy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	adapter := market.NewDummy(2*time.Second, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})))
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+	adapter := market.NewDummy(2*time.Second, log)
 	en := New(
-		slog.Default(),
+		logrus.New(),
 		Config{BusBuffer: 128},
 		adapter,
 		signal.New(),
@@ -48,7 +51,7 @@ func TestEngine_MarketSnapshot_ResetsCycleState(t *testing.T) {
 	sig := signal.New()
 
 	en := New(
-		slog.Default(),
+		logrus.New(),
 		Config{BusBuffer: 128},
 		adapter,
 		sig,

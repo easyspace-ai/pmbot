@@ -1,0 +1,67 @@
+# 编译产物
+bot
+pmbot
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 日志文件（可能包含敏感信息）
+logs/
+*.log
+
+# 测试覆盖率文件
+*.out
+coverage.html
+
+# Go 工作空间文件
+go.work
+go.work.sum
+
+# 依赖目录（如果使用 vendor）
+vendor/
+
+# IDE 和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 环境变量和敏感配置文件
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 用户配置文件（敏感信息）
+user.json
+botuser.json
+/pm/data/user.json
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 数据文件（可能包含敏感信息）
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# 备份文件
+*.bak
+*.backup
+*~
+
+# 配置文件备份
+config.yaml.bak
+config.yaml.backup
+config.yaml~
+

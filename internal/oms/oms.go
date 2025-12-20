@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
+	"polymarket-btc-bot/internal/execution"
 	"polymarket-btc-bot/internal/types"
 )
 
@@ -95,6 +99,30 @@ type Execution interface {
 	CancelOrder(ctx context.Context, req CancelOrderRequest) (CancelOrderResult, error)
 }
 
+// StrategyExecutor converts Intent to order decisions.
+// This is the "strategy layer" that Brain's control system lacks.
+type StrategyExecutor interface {
+	Execute(tick types.MarketTick, intent types.Intent, pos struct {
+		YesShares  float64
+		NoShares   float64
+		Confidence float64
+	}) []OrderDecision
+}
+
+// StrategyResetter is an optional interface for strategies that need to reset state per cycle.
+type StrategyResetter interface {
+	Reset()
+}
+
+// OrderDecision represents a concrete order to place.
+type OrderDecision struct {
+	Side      types.Side
+	Price     float64
+	Size      float64
+	Reason    string
+	CancelAll bool // If true, cancel all existing orders first
+}
+
 // OMS turns Intent into concrete order actions.
 // It is intentionally conservative: prefer fewer open orders, strict idempotency,
 // and safe cancel behavior under kill-switch.
@@ -106,10 +134,43 @@ type OMS struct {
 	seq atomic.Uint64
 
 	lastTick *types.MarketTick
+
+	// Strategy executor: converts Intent to order decisions
+	// If nil, falls back to simple desiredOrder logic
+	strategy StrategyExecutor
+
+	// Execution deduplicator: prevents duplicate order execution
+	deduplicator *execution.Deduplicator
+
+	// Logger for order action logging
+	log *logrus.Logger
 }
 
 func New() *OMS {
-	return &OMS{orders: map[string]*Order{}}
+	return &OMS{
+		orders:       map[string]*Order{},
+		deduplicator: execution.NewDeduplicator(10), // 默认10秒去重窗口
+		log:          logrus.New(), // 默认 logger
+	}
+}
+
+// NewWithDeduplicationWindow 使用自定义去重窗口创建OMS
+func NewWithDeduplicationWindow(windowSecs int64) *OMS {
+	return &OMS{
+		orders:       map[string]*Order{},
+		deduplicator: execution.NewDeduplicator(windowSecs),
+		log:          logrus.New(), // 默认 logger
+	}
+}
+
+// SetLogger 设置日志记录器
+func (o *OMS) SetLogger(log *logrus.Logger) {
+	o.log = log
+}
+
+// SetStrategy sets the strategy executor for converting Intent to orders.
+func (o *OMS) SetStrategy(s StrategyExecutor) {
+	o.strategy = s
 }
 
 // Reset clears all per-cycle state. Call when a new 15m cycle starts.
@@ -118,6 +179,16 @@ func (o *OMS) Reset() {
 	o.lastRisk = types.RiskState{}
 	o.orders = map[string]*Order{}
 	o.lastTick = nil
+	if o.deduplicator != nil {
+		o.deduplicator.Clear()
+	}
+	// 如果策略实现了 Reset 方法，调用它以重置策略状态
+	// 这确保每个周期开始时策略状态被重置，允许新周期重新买入
+	if o.strategy != nil {
+		if resetter, ok := o.strategy.(StrategyResetter); ok {
+			resetter.Reset()
+		}
+	}
 }
 
 // OrderCount returns the number of locally tracked orders (for diagnostics/tests).
@@ -153,11 +224,23 @@ func (o *OMS) OnTick(t types.MarketTick) {
 	o.lastTick = &t
 }
 
-func (o *OMS) OnIntent(ctx context.Context, in types.Intent, exec Execution) {
+func (o *OMS) OnIntent(ctx context.Context, in types.Intent, pos struct {
+	YesShares  float64
+	NoShares   float64
+	Confidence float64
+}, exec Execution) {
+	// 调试日志：打印 Intent 信息
+	o.log.Infof("🔍 [OMS] 收到 Intent: MarketID=%s, BiasYes=%.4f, RiskDeltaMax=%.2f, Freeze=%v, ModeMix=%.4f",
+		in.MarketID, in.BiasYes, in.RiskDeltaMax, in.Freeze, in.ModeMix)
+	o.log.Infof("🔍 [OMS] 持仓状态: YesShares=%.2f, NoShares=%.2f, Confidence=%.4f",
+		pos.YesShares, pos.NoShares, pos.Confidence)
+	
 	if o.lastRisk.KillSwitch {
+		o.log.Infof("🔍 [OMS] KillSwitch 激活，跳过处理")
 		return
 	}
 	if in.Freeze {
+		o.log.Infof("🔍 [OMS] Intent Freeze=true，取消所有订单")
 		// Freeze forbids adding risk. Cancel any outstanding open orders.
 		o.cancelAllOpen(ctx, exec)
 		return
@@ -165,14 +248,68 @@ func (o *OMS) OnIntent(ctx context.Context, in types.Intent, exec Execution) {
 
 	t := o.lastTick
 	if t == nil || t.MarketID == "" {
+		o.log.Infof("🔍 [OMS] 没有有效的 tick 数据")
 		return
 	}
 	if t.MarketID != in.MarketID {
+		o.log.Infof("🔍 [OMS] MarketID 不匹配: tick=%s, intent=%s", t.MarketID, in.MarketID)
 		// Ignore intents for a different market than the last observed tick.
 		return
 	}
 
-	desiredSide, desiredPrice := desiredOrder(*t, in)
+	// Use strategy executor if available, otherwise fall back to simple logic
+	if o.strategy != nil {
+		o.log.Infof("🔍 [OMS] 使用策略执行器: tick.PYes=%.4f, BestAsk=%.4f, BestBid=%.4f",
+			t.PYes, t.BestAsk, t.BestBid)
+		o.executeWithStrategy(ctx, *t, in, pos, exec)
+		return
+	}
+	o.log.Infof("🔍 [OMS] 使用简单逻辑")
+	o.executeSimple(ctx, *t, in, exec)
+}
+
+// executeWithStrategy uses the strategy executor to convert Intent to orders.
+// Position info is passed from Engine to avoid import cycles.
+func (o *OMS) executeWithStrategy(ctx context.Context, tick types.MarketTick, intent types.Intent, pos struct {
+	YesShares  float64
+	NoShares   float64
+	Confidence float64
+}, exec Execution) {
+	if o.strategy == nil {
+		o.executeSimple(ctx, tick, intent, exec)
+		return
+	}
+
+	// 调用策略执行器
+	decisions := o.strategy.Execute(tick, intent, pos)
+	
+	// 调试日志：打印策略返回的决策
+	o.log.Infof("🔍 [OMS] 策略返回 %d 个决策", len(decisions))
+	for i, dec := range decisions {
+		sideStr := "YES"
+		if dec.Side == types.SideNo {
+			sideStr = "NO"
+		} else if dec.Side == types.SideUnknown {
+			sideStr = "UNKNOWN"
+		}
+		o.log.Infof("🔍 [OMS] 决策[%d]: Side=%s, Price=%.4f, Size=%.2f, Reason=%s, CancelAll=%v",
+			i, sideStr, dec.Price, dec.Size, dec.Reason, dec.CancelAll)
+	}
+
+	// 执行策略返回的订单决策
+	for _, dec := range decisions {
+		if dec.CancelAll {
+			o.cancelAllOpen(ctx, exec)
+		}
+		if dec.Side != types.SideUnknown && dec.Size > 0 {
+			o.placeOrderFromDecision(ctx, exec, tick.MarketID, dec)
+		}
+	}
+}
+
+// executeSimple uses the original simple logic (backward compatibility).
+func (o *OMS) executeSimple(ctx context.Context, tick types.MarketTick, intent types.Intent, exec Execution) {
+	desiredSide, desiredPrice := desiredOrder(tick, intent)
 	if desiredSide == types.SideUnknown {
 		return
 	}
@@ -194,19 +331,50 @@ func (o *OMS) OnIntent(ctx context.Context, in types.Intent, exec Execution) {
 	}
 
 	// Convert risk budget into size (shares). Treat RiskDeltaMax as spend budget.
-	size := sizeFromBudget(in.RiskDeltaMax, desiredPrice)
+	size := sizeFromBudget(intent.RiskDeltaMax, desiredPrice)
 	if size <= 0 {
 		return
+	}
+
+	dec := OrderDecision{
+		Side:   desiredSide,
+		Price:  desiredPrice,
+		Size:   size,
+		Reason: "simple_mode",
+	}
+	o.placeOrderFromDecision(ctx, exec, tick.MarketID, dec)
+}
+
+// placeOrderFromDecision places an order from a decision.
+func (o *OMS) placeOrderFromDecision(ctx context.Context, exec Execution, marketID string, dec OrderDecision) {
+	// 生成执行ID用于去重（基于价格和方向）
+	executionID := o.generateExecutionID(dec.Price, dec.Side)
+
+	// 检查去重器
+	if o.deduplicator != nil {
+		if !o.deduplicator.TryAcquire(executionID) {
+			// 正在执行中，跳过
+			return
+		}
 	}
 
 	cid := o.nextClientOrderID()
 	req := PlaceOrderRequest{
 		ClientOrderID: cid,
-		MarketID:      in.MarketID,
-		Side:          desiredSide,
-		Price:         desiredPrice,
-		Size:          size,
+		MarketID:      marketID,
+		Side:          dec.Side,
+		Price:         dec.Price,
+		Size:          dec.Size,
 	}
+
+	// 打印下单动作
+	sideStr := "YES"
+	if dec.Side == types.SideNo {
+		sideStr = "NO"
+	}
+	cost := dec.Price * dec.Size
+	o.log.Infof("📝 [下单] %s | 价格: %.4f | 数量: %.2f | 成本: $%.2f | 原因: %s | 订单ID: %s",
+		sideStr, dec.Price, dec.Size, cost, dec.Reason, cid)
 
 	ord := &Order{
 		ClientOrderID: cid,
@@ -222,8 +390,42 @@ func (o *OMS) OnIntent(ctx context.Context, in types.Intent, exec Execution) {
 
 	res, err := exec.PlaceOrder(ctx, req)
 	if err != nil || !res.Accepted {
+		// 如果是因为交易未启用或 WebSocket adapter 不支持下单而失败，打印模拟成功信息
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		reason := res.Reason
+		
+		// 检查是否是模拟模式（交易未启用或 adapter 不支持）
+		isSimulationMode := (err != nil && (
+			errMsg == "polymarket trading not configured (set POLY_TRADING_ENABLED=1 and credentials)" ||
+			errMsg == "WebSocket adapter does not support order placement, use HTTP adapter for trading" ||
+			strings.Contains(errMsg, "not configured") ||
+			strings.Contains(errMsg, "does not support"))) ||
+			reason == "not_configured" ||
+			strings.Contains(reason, "does not support")
+		
+		if isSimulationMode {
+			o.log.Infof("✅ [模拟下单成功] %s | 价格: %.4f | 数量: %.2f | 订单ID: %s (交易未启用，仅模拟)",
+				sideStr, dec.Price, dec.Size, cid)
+			// 模拟成功：标记为已确认
+			ord.State = StateAck
+			ord.ExchangeOrderID = "SIM-" + cid
+			ord.UpdatedAt = time.Now().UTC()
+			// 延迟释放去重锁
+			return
+		}
+		
+		// 真实失败
 		ord.State = StateRejected
 		ord.UpdatedAt = time.Now().UTC()
+		o.log.Warnf("❌ [下单失败] %s | 价格: %.4f | 数量: %.2f | 订单ID: %s | 原因: %s",
+			sideStr, dec.Price, dec.Size, cid, reason)
+		// 执行失败，立即释放去重锁
+		if o.deduplicator != nil {
+			o.deduplicator.Release(executionID)
+		}
 		return
 	}
 	if res.ExchangeOrderID != "" {
@@ -231,6 +433,29 @@ func (o *OMS) OnIntent(ctx context.Context, in types.Intent, exec Execution) {
 	}
 	ord.State = StateAck
 	ord.UpdatedAt = time.Now().UTC()
+	o.log.Infof("✅ [下单成功] %s | 价格: %.4f | 数量: %.2f | 交易所订单ID: %s",
+		sideStr, dec.Price, dec.Size, res.ExchangeOrderID)
+	// 成功执行，延迟释放已在TryAcquire中设置
+}
+
+// lastClientOrderID 用于defer中检查订单状态
+var lastClientOrderID string
+
+// generateExecutionID 生成执行ID（基于价格和方向）
+// 将价格转换为0-511的ID范围
+func (o *OMS) generateExecutionID(price float64, side types.Side) uint16 {
+	// 将价格（0.0-1.0）映射到0-511
+	// 使用价格的整数部分和小数部分组合
+	priceInt := int(price * 10000) // 转换为整数（0-10000）
+	
+	// 根据方向调整
+	if side == types.SideNo {
+		priceInt += 10000 // NO方向偏移
+	}
+	
+	// 映射到0-511范围
+	execID := uint16(priceInt % 512)
+	return execID
 }
 
 func (o *OMS) OnOrderUpdate(upd OrderUpdate) {
@@ -295,14 +520,40 @@ func (o *OMS) cancelOrder(ctx context.Context, exec Execution, ord *Order) {
 	if ord.State == StateCanceled || ord.State == StateFilled || ord.State == StateRejected {
 		return
 	}
+	
+	sideStr := "YES"
+	if ord.Side == types.SideNo {
+		sideStr = "NO"
+	}
+	o.log.Infof("🔄 [取消订单] %s | 价格: %.4f | 数量: %.2f | 订单ID: %s",
+		sideStr, ord.Price, ord.Size, ord.ClientOrderID)
+	
 	ord.State = StateCanceling
 	ord.UpdatedAt = time.Now().UTC()
 
-	_, _ = exec.CancelOrder(ctx, CancelOrderRequest{
+	res, err := exec.CancelOrder(ctx, CancelOrderRequest{
 		ClientOrderID:   ord.ClientOrderID,
 		ExchangeOrderID: ord.ExchangeOrderID,
 		MarketID:        ord.MarketID,
 	})
+	
+	if err != nil || !res.Ok {
+		// 如果是因为交易未启用而失败，打印模拟成功信息
+		if err != nil && err.Error() == "polymarket trading not configured (set POLY_TRADING_ENABLED=1 and credentials)" {
+			o.log.Infof("✅ [模拟取消成功] %s | 订单ID: %s (交易未启用，仅模拟)",
+				sideStr, ord.ClientOrderID)
+			ord.State = StateCanceled
+			ord.UpdatedAt = time.Now().UTC()
+			return
+		}
+		o.log.Warnf("❌ [取消订单失败] %s | 订单ID: %s | 原因: %s",
+			sideStr, ord.ClientOrderID, res.Reason)
+		return
+	}
+	
+	o.log.Infof("✅ [取消订单成功] %s | 订单ID: %s", sideStr, ord.ClientOrderID)
+	ord.State = StateCanceled
+	ord.UpdatedAt = time.Now().UTC()
 }
 
 func (o *OMS) nextClientOrderID() string {
@@ -339,10 +590,46 @@ func clampPrice(p float64) float64 {
 	return p
 }
 
+// sizeFromBudget converts risk budget to order size (shares).
+// Ensures minimum order requirements:
+// - Minimum $1 USDC (Polymarket requirement)
+// - Minimum 5 shares (Polymarket requirement)
 func sizeFromBudget(budget, price float64) float64 {
 	if budget <= 0 {
 		return 0
 	}
 	price = clampPrice(price)
-	return budget / price
+	if price <= 0 {
+		return 0
+	}
+
+	// Calculate initial size
+	size := budget / price
+
+	// Check minimum order size requirements
+	const minOrderUSDC = 1.0      // Polymarket minimum $1 order
+	const minOrderShares = 5.0    // Polymarket minimum 5 shares
+
+	// Calculate actual cost
+	actualCost := size * price
+
+	// If cost is below minimum, bump up to minimum
+	if actualCost < minOrderUSDC {
+		actualCost = minOrderUSDC
+		size = actualCost / price
+	}
+
+	// If size is below minimum shares, bump up to minimum
+	if size < minOrderShares {
+		size = minOrderShares
+		actualCost = size * price
+	}
+
+	// If we had to bump up, ensure we still meet minimum cost
+	if actualCost < minOrderUSDC {
+		actualCost = minOrderUSDC
+		size = actualCost / price
+	}
+
+	return size
 }

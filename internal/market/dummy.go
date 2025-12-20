@@ -2,9 +2,10 @@ package market
 
 import (
 	"context"
-	"log/slog"
 	"math"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"polymarket-btc-bot/internal/bus"
 	"polymarket-btc-bot/internal/oms"
@@ -14,17 +15,17 @@ import (
 // Dummy adapter emits a synthetic probability curve to exercise the engine.
 type Dummy struct {
 	dur time.Duration
-	log *slog.Logger
+	log *logrus.Logger
 
 	start time.Time
 }
 
-func NewDummy(dur time.Duration, log *slog.Logger) *Dummy {
+func NewDummy(dur time.Duration, log *logrus.Logger) *Dummy {
 	if dur <= 0 {
 		dur = 15 * time.Minute
 	}
 	if log == nil {
-		log = slog.Default()
+		log = logrus.New()
 	}
 	return &Dummy{dur: dur, log: log}
 }
@@ -81,12 +82,20 @@ func (d *Dummy) Start(ctx context.Context, bus *bus.Bus) error {
 func (d *Dummy) PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) (oms.PlaceOrderResult, error) {
 	_ = ctx
 	// In dummy mode, accept but do not generate fills.
-	d.log.Info("dummy place", "cid", req.ClientOrderID, "side", req.Side.String(), "price", req.Price, "size", req.Size)
+	d.log.WithFields(map[string]interface{}{
+		"cid":  req.ClientOrderID,
+		"side": req.Side.String(),
+		"price": req.Price,
+		"size": req.Size,
+	}).Info("dummy place")
 	return oms.PlaceOrderResult{ExchangeOrderID: "DUMMY-EX-" + req.ClientOrderID, Accepted: true}, nil
 }
 
 func (d *Dummy) CancelOrder(ctx context.Context, req oms.CancelOrderRequest) (oms.CancelOrderResult, error) {
 	_ = ctx
-	d.log.Info("dummy cancel", "cid", req.ClientOrderID, "oid", req.ExchangeOrderID)
+	d.log.WithFields(map[string]interface{}{
+		"cid": req.ClientOrderID,
+		"oid": req.ExchangeOrderID,
+	}).Info("dummy cancel")
 	return oms.CancelOrderResult{Ok: true}, nil
 }

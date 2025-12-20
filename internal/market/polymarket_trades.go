@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -11,6 +12,9 @@ import (
 	"polymarket-btc-bot/internal/bus"
 	"polymarket-btc-bot/internal/oms"
 	"polymarket-btc-bot/internal/types"
+	
+	"polymarket-btc-bot/internal/clob/signing"
+	clobtypes "polymarket-btc-bot/internal/clob/types"
 )
 
 // CLOB /data/trades is authenticated (L2). We poll it and emit Fill events.
@@ -78,13 +82,66 @@ func (p *Polymarket) pollTradesLoop(ctx context.Context, b *bus.Bus) {
 
 func (p *Polymarket) pullTradesOnce(ctx context.Context, b *bus.Bus, cursor string, seen map[string]struct{}) (string, error) {
 	url := fmt.Sprintf("%s/data/trades?market=%s&next_cursor=%s", p.baseURL, p.marketID, cursor)
-	headers := p.l2Headers("GET", "/data/trades", nil)
-	body, status, err := p.do(ctx, http.MethodGet, url, headers, nil)
+	
+	// 构建L2认证头
+	if p.apiCreds == nil {
+		return "", fmt.Errorf("API credentials not initialized")
+	}
+	
+	clobCreds := &clobtypes.ApiKeyCreds{
+		Key:        p.apiCreds.APIKey,
+		Secret:     p.apiCreds.APISecret,
+		Passphrase: p.apiCreds.APIPassphrase,
+	}
+	
+	priv, _, err := parsePrivateKeyHelper(p.privateKey)
 	if err != nil {
 		return "", err
 	}
-	if status/100 != 2 {
-		return "", fmt.Errorf("http %d: %s", status, trunc(body, 256))
+	
+	l2HeaderArgs := &clobtypes.L2HeaderArgs{
+		Method:      "GET",
+		RequestPath: "/data/trades",
+		Body:        nil,
+	}
+	
+	headers, err := signing.CreateL2Headers(priv, clobCreds, l2HeaderArgs, nil)
+	if err != nil {
+		return "", err
+	}
+	
+	headerMap := map[string]string{
+		"POLY_ADDRESS":    headers.PolyAddress,
+		"POLY_SIGNATURE":  headers.PolySignature,
+		"POLY_TIMESTAMP":  headers.PolyTimestamp,
+		"POLY_API_KEY":    headers.PolyAPIKey,
+		"POLY_PASSPHRASE": headers.PolyPassphrase,
+	}
+	
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	
+	for k, v := range headerMap {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("user-agent", "polymarket-btc-bot/0.1")
+	
+	res, err := p.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", err
+	}
+	
+	if res.StatusCode/100 != 2 {
+		return "", fmt.Errorf("http %d: %s", res.StatusCode, truncHelper(body, 256))
 	}
 
 	var resp clobTradesResp
@@ -125,4 +182,5 @@ func (p *Polymarket) pullTradesOnce(ctx context.Context, b *bus.Bus, cursor stri
 
 	return resp.NextCursor, nil
 }
+
 

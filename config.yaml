@@ -1,0 +1,64 @@
+# PMBot 配置文件示例
+# 支持 YAML 和 JSON 格式
+# 
+# 注意：钱包配置（private_key, funder_address）和 API 凭证（api_key, api_secret, api_passphrase）
+# 会自动从 /pm/data/user.json 加载，无需在此配置
+
+# 代理配置
+proxy:
+  host: "127.0.0.1"
+  port: 15236
+
+# 策略配置
+strategies:
+  enabled:
+    - "simple_threshold"  # 简单阈值策略：价格 >= 60 分买入，+3 分自动卖出
+  simple_threshold:
+    buy_threshold: 0.60  # 买入阈值（0.60 = 60分）
+    profit_target: 0.03  # 止盈目标（0.03 = 3分）
+    order_size: 10.0     # 订单大小
+
+# 日志配置
+log_level: "debug"      # debug, info, warn, error
+log_file: "logs/combined.log"
+log_by_cycle: true     # 是否按周期命名日志文件
+
+# Polymarket 配置
+polymarket:
+  # 基础配置
+  base_url: "https://clob.polymarket.com"
+  market_slug_regex: "^btc-updown-15m-\\d+$"  # 市场 slug 正则表达式
+  
+  # 市场信息（可选，如果不设置会自动发现）
+  market_id: ""
+  yes_token_id: ""
+  no_token_id: ""
+  
+  # 轮询间隔（仅在 use_websocket=false 时使用）
+  poll_interval: "300ms"
+  
+  # 交易配置
+  trading_enabled: false
+  chain_id: 137
+  signature_type: 0
+  
+  # 注意：private_key, funder, api_key, api_secret, api_passphrase 从 /pm/data/user.json 加载
+  
+  # WebSocket 配置
+  use_websocket: true  # 是否使用 WebSocket 实时数据（推荐）
+  websocket_proxy: ""  # WebSocket 代理 URL（可选，默认使用 proxy 配置）
+
+# 熔断器配置（Circuit Breaker）
+circuit_breaker:
+  enabled: true                    # 是否启用熔断器
+  max_position_per_market: 50000   # 单市场最大仓位（合约数）
+  max_total_position: 100000       # 总最大仓位（合约数）
+  max_daily_loss: 500.0            # 最大日亏损（美元）
+  max_consecutive_errors: 5        # 最大连续错误数
+  cooldown_secs: 300               # 冷却期（秒，5分钟）
+
+# 执行配置
+execution:
+  deduplication_enabled: true      # 是否启用去重
+  deduplication_window_secs: 10    # 去重窗口（秒）
+

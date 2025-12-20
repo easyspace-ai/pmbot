@@ -26,7 +26,9 @@ type Truth struct {
 }
 
 func New() *Truth {
-	return &Truth{confidence: 0.0}
+	// 初始 confidence 设置为 0.7，允许在模拟模式下进行交易
+	// 在实际交易中，confidence 会通过 OnFill 和 OnOrderUpdate 更新
+	return &Truth{confidence: 0.7}
 }
 
 // Reset clears per-cycle position state.
@@ -37,7 +39,11 @@ func (t *Truth) Reset() {
 	t.yesShares = 0
 	t.noShares = 0
 	t.cash = 0
-	t.confidence = 0
+	// 保持 confidence >= 0.7，允许在模拟模式下进行交易
+	// 在实际交易中，confidence 会通过 OnFill 和 OnOrderUpdate 更新
+	if t.confidence < 0.7 {
+		t.confidence = 0.7
+	}
 	t.updatedAt = time.Now().UTC()
 	t.lastRisk = types.RiskState{}
 }

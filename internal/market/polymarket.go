@@ -4,15 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"polymarket-btc-bot/internal/bus"
 	"polymarket-btc-bot/internal/types"
+	
+	clobclient "polymarket-btc-bot/internal/clob/client"
+	clobtypes "polymarket-btc-bot/internal/clob/types"
 )
 
 // Polymarket is a minimal real-data adapter:
@@ -21,7 +26,7 @@ import (
 //
 // Order placement/cancel is scaffolded but may require auth/signing details.
 type Polymarket struct {
-	log *slog.Logger
+	log *logrus.Logger
 
 	http *http.Client
 
@@ -53,6 +58,7 @@ type Polymarket struct {
 	funder         string
 	signatureType  uint8
 	apiCreds       *apiCreds
+	clobClient     *clobclient.Client // CLOB客户端
 
 	// L2 polling cursors/dedup
 	ordersCursor string
@@ -78,7 +84,7 @@ type PolymarketConfig struct {
 	APIPassphrase string
 }
 
-func NewPolymarketFromEnv(log *slog.Logger) *Polymarket {
+func NewPolymarketFromEnv(log *logrus.Logger) *Polymarket {
 	cfg := PolymarketConfig{
 		BaseURL:         getenvDefault("POLY_CLOB_BASE_URL", "https://clob.polymarket.com"),
 		MarketSlugRegex: os.Getenv("POLY_MARKET_SLUG_REGEX"),
@@ -100,9 +106,9 @@ func NewPolymarketFromEnv(log *slog.Logger) *Polymarket {
 	return NewPolymarket(log, cfg)
 }
 
-func NewPolymarket(log *slog.Logger, cfg PolymarketConfig) *Polymarket {
+func NewPolymarket(log *logrus.Logger, cfg PolymarketConfig) *Polymarket {
 	if log == nil {
-		log = slog.Default()
+		log = logrus.New()
 	}
 	re := (*regexp.Regexp)(nil)
 	if cfg.MarketSlugRegex != "" {
@@ -150,16 +156,16 @@ func (p *Polymarket) Start(ctx context.Context, b *bus.Bus) error {
 		},
 	})
 
-	p.log.Info("polymarket adapter ready",
-		"base", p.baseURL,
-		"market_id", p.marketID,
-		"market_slug", p.marketSlug,
-		"yes_token_id", p.yesTokenID,
-		"no_token_id", p.noTokenID,
-		"end_date", p.endDate.Format(time.RFC3339),
-		"poll_interval", p.pollInterval.String(),
-		"trading_enabled", p.tradingEnabled,
-	)
+	p.log.WithFields(map[string]interface{}{
+		"base":           p.baseURL,
+		"market_id":      p.marketID,
+		"market_slug":    p.marketSlug,
+		"yes_token_id":   p.yesTokenID,
+		"no_token_id":    p.noTokenID,
+		"end_date":       p.endDate.Format(time.RFC3339),
+		"poll_interval":  p.pollInterval.String(),
+		"trading_enabled": p.tradingEnabled,
+	}).Info("polymarket adapter ready")
 
 	if p.tradingEnabled {
 		if err := p.initTrading(ctx); err != nil {
@@ -307,87 +313,113 @@ type clobToken struct {
 	Price   float64 `json:"price"`
 }
 
+// fetchMarketBySlugFromGamma 从 Gamma API 根据 slug 获取市场信息
+func (p *Polymarket) fetchMarketBySlugFromGamma(ctx context.Context, slug string) (*gammaMarket, error) {
+	gammaURL := "https://gamma-api.polymarket.com/markets"
+	u := fmt.Sprintf("%s?slug=%s&closed=false", gammaURL, url.QueryEscape(slug))
+	
+	var markets []gammaMarket
+	if err := p.getJSON(ctx, u, &markets); err != nil {
+		return nil, fmt.Errorf("从 Gamma API 获取市场失败: %w", err)
+	}
+	
+	if len(markets) == 0 {
+		return nil, fmt.Errorf("未找到市场: %s", slug)
+	}
+	
+	return &markets[0], nil
+}
+
+// fetchMarketFromCLOB 从 CLOB API 根据 conditionID 获取完整市场信息（包括 token IDs）
+func (p *Polymarket) fetchMarketFromCLOB(ctx context.Context, conditionID string) (*clobMarket, error) {
+	u := fmt.Sprintf("%s/markets/%s", p.baseURL, conditionID)
+	
+	var market clobMarket
+	if err := p.getJSON(ctx, u, &market); err != nil {
+		return nil, fmt.Errorf("从 CLOB API 获取市场失败: %w", err)
+	}
+	
+	return &market, nil
+}
+
+type gammaMarket struct {
+	ID           string `json:"id"`
+	Question     string `json:"question"`
+	ConditionID  string `json:"conditionId"`
+	Slug         string `json:"slug"`
+	ClobTokenIDs string `json:"clobTokenIds"` // JSON 字符串数组，如 ["token1", "token2"]
+	EndDate      string `json:"endDate"`
+	StartDate    string `json:"startDate"`
+	Category     string `json:"category"`
+	Active       bool   `json:"active"`
+	Closed       bool   `json:"closed"`
+}
+
 func (p *Polymarket) discover(ctx context.Context) error {
-	if p.marketSlugRegex == nil && (p.yesTokenID == "" || p.noTokenID == "" || p.marketID == "") {
-		// Default strict pattern for BTC 15m Up/Down markets:
-		// btc-updown-15m-<unix_timestamp>
-		// User can override with POLY_MARKET_SLUG_REGEX.
-		p.marketSlugRegex = regexp.MustCompile(`^btc-updown-15m-\d+$`)
+	// 如果已经提供了市场信息，直接使用
+	if p.yesTokenID != "" && p.noTokenID != "" && p.marketID != "" {
+		p.log.Infof("使用配置的市场信息: market_id=%s", p.marketID)
+		return nil
 	}
-
-	limit := 200
-	cursor := ""
-
-	type cand struct {
-		m   clobMarket
-		end time.Time
-		yes string
-		no  string
+	
+	// 按照 gobet 的方式：根据当前周期时间戳生成 slug，然后查询
+	currentTs := GetCurrent15MinTimestamp()
+	currentSlug := Generate15MinSlug(currentTs)
+	
+	p.log.Infof("根据当前周期发现市场: slug=%s (timestamp=%d)", currentSlug, currentTs)
+	
+	// 步骤1: 从 Gamma API 获取市场基本信息（包括 conditionID）
+	gammaMarket, err := p.fetchMarketBySlugFromGamma(ctx, currentSlug)
+	if err != nil {
+		// 如果当前周期市场不存在，尝试下一个周期（可能市场还没创建）
+		nextTs := GetNextCycleTimestamp(currentTs)
+		nextSlug := Generate15MinSlug(nextTs)
+		p.log.Warnf("当前周期市场不存在，尝试下一个周期: %s", nextSlug)
+		
+		gammaMarket, err = p.fetchMarketBySlugFromGamma(ctx, nextSlug)
+		if err != nil {
+			return fmt.Errorf("无法找到当前或下一个周期的市场: %w", err)
+		}
+		// 使用下一个周期的 slug
+		currentSlug = nextSlug
+		currentTs = nextTs
 	}
-	var best *cand
-
-	for page := 0; page < 30; page++ {
-		u := fmt.Sprintf("%s/markets?limit=%d", p.baseURL, limit)
-		if cursor != "" {
-			u += "&next_cursor=" + cursor
-		}
-
-		var resp clobMarketsResponse
-		if err := p.getJSON(ctx, u, &resp); err != nil {
-			return err
-		}
-
-		for _, m := range resp.Data {
-			// For BTC 15m markets we key off market_slug format; question text is not stable.
-			if p.marketSlugRegex != nil && !p.marketSlugRegex.MatchString(m.MarketSlug) {
-				continue
-			}
-			if !m.EnableOrderBook || !m.AcceptingOrders || m.Closed || !m.Active {
-				continue
-			}
-			yes, no := pickYesNoTokens(m.Tokens)
-			if yes == "" || no == "" {
-				continue
-			}
-			end, err := time.Parse(time.RFC3339, m.EndDateISO)
-			if err != nil {
-				continue
-			}
-			// Must be future-dated to be considered the current tradable 15m market.
-			if time.Until(end) <= 0 {
-				continue
-			}
-
-			c := &cand{m: m, end: end, yes: yes, no: no}
-			// Pick the market with the nearest upcoming end time.
-			if best == nil || c.end.Before(best.end) {
-				best = c
-			}
-		}
-
-		if resp.NextCursor == "" {
-			break
-		}
-		cursor = resp.NextCursor
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(150 * time.Millisecond):
-		}
+	
+	if gammaMarket.ConditionID == "" {
+		return fmt.Errorf("Gamma API 返回的市场缺少 conditionID: %s", currentSlug)
 	}
-
-	if best == nil {
-		return fmt.Errorf("no matching market found (set POLY_MARKET_SLUG_REGEX or POLY_YES_TOKEN_ID/POLY_NO_TOKEN_ID/POLY_MARKET_ID)")
+	
+	// 步骤2: 从 CLOB API 获取完整市场信息（包括 token IDs）
+	clobMarket, err := p.fetchMarketFromCLOB(ctx, gammaMarket.ConditionID)
+	if err != nil {
+		return fmt.Errorf("从 CLOB API 获取市场信息失败: %w", err)
 	}
-
-	p.marketID = best.m.ConditionID
-	p.yesTokenID = best.yes
-	p.noTokenID = best.no
-	p.marketSlug = best.m.MarketSlug
-	p.endDate = best.end
-	p.negRisk = best.m.NegRisk
-	p.minOrderSize = best.m.MinOrderSize
-	p.minTickSize = fmtTickSize(best.m.MinTickSize)
+	
+	// 解析 token IDs
+	yes, no := pickYesNoTokens(clobMarket.Tokens)
+	if yes == "" || no == "" {
+		return fmt.Errorf("无法从市场数据中提取 token IDs: conditionID=%s", gammaMarket.ConditionID)
+	}
+	
+	// 解析结束时间
+	endDate, err := time.Parse(time.RFC3339, clobMarket.EndDateISO)
+	if err != nil {
+		return fmt.Errorf("解析结束时间失败: %w", err)
+	}
+	
+	// 设置市场信息
+	p.marketID = gammaMarket.ConditionID
+	p.yesTokenID = yes
+	p.noTokenID = no
+	p.marketSlug = currentSlug
+	p.endDate = endDate
+	p.negRisk = clobMarket.NegRisk
+	p.minOrderSize = clobMarket.MinOrderSize
+	p.minTickSize = fmtTickSize(clobMarket.MinTickSize)
+	
+	p.log.Infof("市场发现成功: slug=%s, condition_id=%s, end_date=%s, minutes_remaining=%.1f",
+		currentSlug, gammaMarket.ConditionID, endDate.Format(time.RFC3339), time.Until(endDate).Minutes())
+	
 	return nil
 }
 
@@ -404,6 +436,45 @@ type clobLevel struct {
 }
 
 func (p *Polymarket) getBestBidAsk(ctx context.Context, tokenID string) (bid, ask float64, ts time.Time, err error) {
+	// 使用CLOB客户端获取订单簿
+	// 优先使用缓存（快速），如果缓存不可用则获取最新数据
+	if p.clobClient != nil {
+		var book *clobtypes.OrderBookSummary
+		
+		// 尝试从缓存获取（快速，~50ms）
+		cachedBook, ok := p.clobClient.GetCachedOrderBook(tokenID)
+		if ok {
+			book = cachedBook
+		} else {
+			// 缓存不可用，获取最新数据（较慢，~200ms）
+			book, err = p.clobClient.GetOrderBook(ctx, tokenID, nil)
+			if err != nil {
+				// 如果CLOB客户端失败，回退到原有方法
+				goto fallback
+			}
+		}
+		
+		if book != nil {
+			if len(book.Bids) > 0 {
+				bid, _ = strconv.ParseFloat(book.Bids[0].Price, 64)
+			}
+			if len(book.Asks) > 0 {
+				ask, _ = strconv.ParseFloat(book.Asks[0].Price, 64)
+			}
+			// Timestamp is milliseconds since epoch.
+			if book.Timestamp != "" {
+				ms, parseErr := strconv.ParseInt(book.Timestamp, 10, 64)
+				if parseErr == nil {
+					ts = time.UnixMilli(ms).UTC()
+				}
+			}
+			return bid, ask, ts, nil
+		}
+	}
+	
+fallback:
+	
+	// 回退到原有的HTTP方法
 	u := fmt.Sprintf("%s/book?token_id=%s", p.baseURL, tokenID)
 	var book clobBook
 	if err := p.getJSON(ctx, u, &book); err != nil {
