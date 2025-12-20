@@ -144,6 +144,10 @@ type OpenOrderParams struct {
 type CreateOrderOptions struct {
 	TickSize TickSize
 	NegRisk  *bool
+	
+	// TimeInForce 订单有效期策略 (GTC, GTD, FOK, IOC)
+	// 默认为 GTC
+	TimeInForce *string
 }
 
 // OrderScoringParams 订单评分参数

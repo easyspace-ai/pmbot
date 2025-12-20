@@ -49,7 +49,10 @@ func main() {
 
 	// 选择一个“可解释”的策略：简单阈值（触发一次买入并挂止盈单）
 	// 你也可以注释掉这行，让 OMS 走 executeSimple（由 Brain 的 BiasYes 驱动）
-	o.SetStrategy(strategy.NewSimpleThresholdStrategyWithConfig(0.60, 0.03, 10))
+	// o.SetStrategy(strategy.NewSimpleThresholdStrategyWithConfig(0.60, 0.03, 10))
+	
+	// 使用 ArbitrageStrategy (Volume Bot)
+	o.SetStrategy(strategy.NewArbitrageStrategy())
 
 	eng := engine.New(
 		log,

@@ -32,6 +32,12 @@ const (
 	reconnectDelaySecs     = 2     // 重连延迟（秒）
 )
 
+type priceLevel struct {
+	BestBid float64
+	BestAsk float64
+	Ts      time.Time
+}
+
 // WebSocketAdapter 是使用 WebSocket 实时数据的市场适配器
 // 它保持与 PMBot 单线程架构的兼容性，通过事件总线发布事件
 type WebSocketAdapter struct {
@@ -86,6 +92,10 @@ type WebSocketAdapter struct {
 	reconnectAttempts     atomic.Int32
 	connectionStart       time.Time
 	connectionStartMu     sync.RWMutex
+
+	// 价格缓存 (TokenID -> PriceLevel)
+	priceCache   map[string]priceLevel
+	priceCacheMu sync.RWMutex
 }
 
 // NewWebSocketAdapter 创建新的 WebSocket 适配器
@@ -96,6 +106,7 @@ func NewWebSocketAdapter(log *logrus.Logger, proxyURL string) *WebSocketAdapter 
 		closeC:     make(chan struct{}),
 		proxyURL:   proxyURL,
 		lastPong:   time.Now(),
+		priceCache: make(map[string]priceLevel),
 	}
 }
 
@@ -195,6 +206,11 @@ func (w *WebSocketAdapter) DialAndConnect(ctx context.Context) error {
 	w.updateMu.Lock()
 	w.lastUpdateTime = time.Time{}
 	w.updateMu.Unlock()
+	
+	// 重置价格缓存
+	w.priceCacheMu.Lock()
+	w.priceCache = make(map[string]priceLevel)
+	w.priceCacheMu.Unlock()
 
 	// 原子替换连接
 	connCtx, connCancel := w.SetConn(ctx, conn)
@@ -210,7 +226,6 @@ func (w *WebSocketAdapter) DialAndConnect(ctx context.Context) error {
 	}
 
 	// 等待首次快照（非阻塞，如果超时则继续运行）
-	// 使用带超时的等待，但不因为超时就失败
 	snapshotChan := make(chan bool, 1)
 	go func() {
 		received := w.waitForFirstSnapshot(ctx)
@@ -221,18 +236,15 @@ func (w *WebSocketAdapter) DialAndConnect(ctx context.Context) error {
 	select {
 	case received := <-snapshotChan:
 		if received {
-			// 验证订单簿完整性
 			if !w.validateOrderbook() {
 				w.log.Warnf("订单簿验证失败，但继续运行")
 			} else {
 				w.log.Infof("订单簿验证通过")
 			}
 		} else {
-			// 超时但继续运行（可能市场暂时没有活动）
 			w.log.Warnf("等待首次快照超时，但继续运行（可能市场暂时没有活动，后续收到数据会自动恢复）")
 		}
 	case <-time.After(time.Duration(snapshotTimeoutSecs) * time.Second):
-		// 超时，但继续运行
 		w.log.Warnf("等待首次快照超时（%d秒），但继续运行（可能市场暂时没有活动）", snapshotTimeoutSecs)
 	}
 
@@ -470,8 +482,8 @@ func (w *WebSocketAdapter) handleMessage(ctx context.Context, message []byte) {
 			w.snapshotMu.Unlock()
 			w.log.Infof("✅ 收到订单簿快照（首次快照）")
 		}
-		// 处理订单簿消息（可选，通常价格变化会通过 price_change 发送）
-		w.log.Debugf("收到订单簿快照消息")
+		// 处理订单簿快照（也可视为价格更新）
+		w.handlePriceChange(ctx, message)
 	case "price_change":
 		// 标记收到首次快照（价格变化表示数据流已开始）
 		if !w.firstSnapshotReceived.Load() {
@@ -489,7 +501,7 @@ func (w *WebSocketAdapter) handleMessage(ctx context.Context, message []byte) {
 		w.lastPong = time.Now()
 		w.healthCheckMu.Unlock()
 	case "last_trade_price":
-		// 最后成交价消息（也可以作为首次数据）
+		// 最后成交价消息
 		if !w.firstSnapshotReceived.Load() {
 			w.firstSnapshotReceived.Store(true)
 			w.snapshotMu.Lock()
@@ -497,7 +509,6 @@ func (w *WebSocketAdapter) handleMessage(ctx context.Context, message []byte) {
 			w.snapshotMu.Unlock()
 			w.log.Infof("✅ 收到最后成交价（首次快照）")
 		}
-		w.log.Debugf("收到最后成交价消息")
 	case "tick_size_change":
 		w.log.Debugf("收到 tick size 变化消息")
 	default:
@@ -513,53 +524,108 @@ func (w *WebSocketAdapter) handlePriceChange(ctx context.Context, message []byte
 		return
 	}
 
-	priceChanges, ok := msg["price_changes"].([]interface{})
-	if !ok {
-		return
-	}
+	// 兼容 'book' 和 'price_change' 消息结构
+	// book 消息直接包含 bids/asks
+	// price_change 包含 price_changes 数组
+	
+	var updates []map[string]interface{}
 
-	// 提取价格信息
-	var bestBid, bestAsk float64
-	var ts time.Time
-
-	for _, pc := range priceChanges {
-		change, ok := pc.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		assetID, _ := change["asset_id"].(string)
-		if assetID != w.yesTokenID {
-			continue
-		}
-
-		// 获取价格
-		if bestAskStr, ok := change["best_ask"].(string); ok && bestAskStr != "" {
-			bestAsk, _ = strconv.ParseFloat(bestAskStr, 64)
-		}
-		if bestBidStr, ok := change["best_bid"].(string); ok && bestBidStr != "" {
-			bestBid, _ = strconv.ParseFloat(bestBidStr, 64)
-		}
-
-		// 获取时间戳
-		if tsStr, ok := change["timestamp"].(string); ok {
-			if ms, err := strconv.ParseInt(tsStr, 10, 64); err == nil {
-				ts = time.UnixMilli(ms).UTC()
+	if val, ok := msg["price_changes"]; ok {
+		// price_change 格式
+		if list, ok := val.([]interface{}); ok {
+			for _, item := range list {
+				if m, ok := item.(map[string]interface{}); ok {
+					updates = append(updates, m)
+				}
 			}
 		}
+	} else if _, ok := msg["bids"]; ok {
+		// book 格式（单个 asset）
+		assetID, _ := msg["asset_id"].(string)
+		if assetID != "" {
+			updates = append(updates, msg)
+		}
 	}
 
-	if bestBid <= 0 && bestAsk <= 0 {
+	if len(updates) == 0 {
 		return
 	}
 
-	// 计算 pYes（使用包内辅助函数）
-	pYes := calculateMidpoint(bestBid, bestAsk)
+	w.priceCacheMu.Lock()
+	updated := false
+	
+	// 更新缓存
+	for _, u := range updates {
+		assetID, _ := u["asset_id"].(string)
+		if assetID != w.yesTokenID && assetID != w.noTokenID {
+			continue
+		}
+
+		// 获取现有价格或初始化
+		pl := w.priceCache[assetID]
+		
+		// 解析 bids (Best Bid)
+		if bids, ok := u["bids"].([]interface{}); ok && len(bids) > 0 {
+			if bidLevel, ok := bids[0].(map[string]interface{}); ok {
+				if priceStr, ok := bidLevel["price"].(string); ok {
+					if p, err := strconv.ParseFloat(priceStr, 64); err == nil {
+						pl.BestBid = p
+					}
+				}
+			}
+		} else if bidStr, ok := u["best_bid"].(string); ok && bidStr != "" {
+             // 某些消息格式可能直接包含 best_bid
+             if p, err := strconv.ParseFloat(bidStr, 64); err == nil {
+                 pl.BestBid = p
+             }
+        }
+		
+		// 解析 asks (Best Ask)
+		if asks, ok := u["asks"].([]interface{}); ok && len(asks) > 0 {
+			if askLevel, ok := asks[0].(map[string]interface{}); ok {
+				if priceStr, ok := askLevel["price"].(string); ok {
+					if p, err := strconv.ParseFloat(priceStr, 64); err == nil {
+						pl.BestAsk = p
+					}
+				}
+			}
+		} else if askStr, ok := u["best_ask"].(string); ok && askStr != "" {
+             if p, err := strconv.ParseFloat(askStr, 64); err == nil {
+                 pl.BestAsk = p
+             }
+        }
+
+		// 更新时间戳
+		if tsStr, ok := u["timestamp"].(string); ok {
+			if ms, err := strconv.ParseInt(tsStr, 10, 64); err == nil {
+				pl.Ts = time.UnixMilli(ms).UTC()
+			}
+		} else {
+			pl.Ts = time.Now().UTC()
+		}
+
+		w.priceCache[assetID] = pl
+		updated = true
+	}
+	w.priceCacheMu.Unlock()
+
+	if !updated {
+		return
+	}
+
+	// 从缓存读取最新状态并发布
+	w.priceCacheMu.RLock()
+	yesPL := w.priceCache[w.yesTokenID]
+	noPL := w.priceCache[w.noTokenID]
+	w.priceCacheMu.RUnlock()
+
+	// 计算 PYes (中间价)
+	pYes := calculateMidpoint(yesPL.BestBid, yesPL.BestAsk)
 	if pYes <= 0 {
-		if bestAsk > 0 {
-			pYes = bestAsk
-		} else if bestBid > 0 {
-			pYes = bestBid
+		if yesPL.BestAsk > 0 {
+			pYes = yesPL.BestAsk
+		} else if yesPL.BestBid > 0 {
+			pYes = yesPL.BestBid
 		} else {
 			pYes = 0.5
 		}
@@ -570,14 +636,22 @@ func (w *WebSocketAdapter) handlePriceChange(ctx context.Context, message []byte
 		rem = 0
 	}
 
-	// 发布价格变化事件到总线（单线程引擎会处理）
+	// 确定交易所时间戳（使用最新的）
+	ts := yesPL.Ts
+	if noPL.Ts.After(ts) {
+		ts = noPL.Ts
+	}
+
+	// 发布完整的 MarketTick
 	_ = w.bus.Publish(ctx, types.Event{
 		Type: types.EventMarketTick,
 		Payload: types.MarketTick{
 			MarketID:      w.marketID,
 			PYes:          calculateClamp01(pYes),
-			BestBid:       calculateClamp01(bestBid),
-			BestAsk:       calculateClamp01(bestAsk),
+			BestBid:       calculateClamp01(yesPL.BestBid),
+			BestAsk:       calculateClamp01(yesPL.BestAsk),
+			BestBidNo:     calculateClamp01(noPL.BestBid),
+			BestAskNo:     calculateClamp01(noPL.BestAsk),
 			TimeRemaining: rem,
 			DataQuality:   0.95, // WebSocket 数据质量高
 		},
@@ -645,8 +719,6 @@ func (w *WebSocketAdapter) checkAndSwitchCycle(ctx context.Context) {
 	w.log.Infof("获取下一个周期市场: %s (timestamp=%d)", nextSlug, nextTs)
 	
 	// 使用 Polymarket 适配器获取下一个周期的市场信息
-	// 新的 discover 方法会根据当前周期时间戳自动查找
-	// 由于周期已经切换，GetCurrent15MinTimestamp() 应该返回下一个周期的时间戳
 	polymarket := NewPolymarketFromEnv(w.log)
 	
 	// 使用 discover 方法获取市场信息
@@ -655,7 +727,6 @@ func (w *WebSocketAdapter) checkAndSwitchCycle(ctx context.Context) {
 	
 	if err := polymarket.discover(discoverCtx); err != nil {
 		w.log.Errorf("获取下一个周期市场失败: %v，将重试", err)
-		// 如果获取失败，可能市场还没创建，等待一段时间后重试
 		go func() {
 			time.Sleep(5 * time.Second)
 			w.switchingCycle.Store(false) // 重置标志，允许重试
@@ -665,7 +736,6 @@ func (w *WebSocketAdapter) checkAndSwitchCycle(ctx context.Context) {
 	
 	// 验证获取到的市场是否匹配下一个周期
 	if polymarket.marketSlug != nextSlug {
-		// 如果 slug 不匹配，检查时间戳是否匹配（可能市场 slug 格式有变化）
 		actualTs := ExtractTimestampFromSlug(polymarket.marketSlug)
 		if actualTs != nextTs {
 			w.log.Warnf("获取到的市场时间戳不匹配: 期望=%d (%s), 实际=%d (%s)，但继续使用", 
@@ -715,9 +785,6 @@ func (w *WebSocketAdapter) checkAndSwitchCycle(ctx context.Context) {
 
 // discoverMarket 发现市场（复用原有逻辑）
 func (w *WebSocketAdapter) discoverMarket(ctx context.Context, httpClient *http.Client) error {
-	// 这里可以复用原有的市场发现逻辑
-	// 为了简化，假设市场信息已经通过配置提供
-	// 如果需要，可以从 HTTP API 发现市场
 	return nil
 }
 
@@ -734,23 +801,16 @@ func (w *WebSocketAdapter) SetMarketInfo(marketID, marketSlug, yesTokenID, noTok
 }
 
 // PlaceOrder 实现 Adapter 接口（委托给 HTTP 客户端）
-// WebSocket 适配器主要用于接收市场数据，订单操作仍使用 HTTP API
 func (w *WebSocketAdapter) PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) (oms.PlaceOrderResult, error) {
-	// WebSocket 适配器主要用于市场数据，订单操作需要 HTTP 客户端
-	// 这里返回错误，提示需要使用支持交易的适配器
 	return oms.PlaceOrderResult{
 		Accepted: false,
 		Reason:   "WebSocket adapter does not support order placement, use HTTP adapter for trading",
 	}, fmt.Errorf("WebSocket adapter does not support order placement")
 }
 
-// CancelOrder 实现 Adapter 接口（委托给 HTTP 客户端）
-func (w *WebSocketAdapter) CancelOrder(ctx context.Context, req oms.CancelOrderRequest) (oms.CancelOrderResult, error) {
-	// WebSocket 适配器主要用于市场数据，订单操作需要 HTTP 客户端
-	return oms.CancelOrderResult{
-		Ok:     false,
-		Reason: "WebSocket adapter does not support order cancellation, use HTTP adapter for trading",
-	}, fmt.Errorf("WebSocket adapter does not support order cancellation")
+// MergePositions 实现 Adapter 接口（WebSocket adapter 不支持合并）
+func (w *WebSocketAdapter) MergePositions(ctx context.Context, amount float64) (string, error) {
+	return "", fmt.Errorf("WebSocket adapter does not support merge positions, use HTTP adapter")
 }
 
 // Close 关闭连接
@@ -834,8 +894,6 @@ func (w *WebSocketAdapter) waitForFirstSnapshot(ctx context.Context) bool {
 			elapsed := time.Since(start)
 			if elapsed > time.Duration(snapshotTimeoutSecs)*time.Second {
 				w.log.Warnf("等待首次快照超时（%d秒），但继续运行（可能市场暂时没有活动）", snapshotTimeoutSecs)
-				// 不返回 false，而是继续运行（可能市场暂时没有活动）
-				// 后续如果有数据会自然标记为已收到快照
 				return false
 			}
 		}
@@ -859,7 +917,6 @@ func (w *WebSocketAdapter) checkOrderbookStaleness() bool {
 	lastUpdate := w.lastUpdateTime
 	w.updateMu.RUnlock()
 
-	// 如果从未收到更新，不认为过期（可能是刚连接）
 	if lastUpdate.IsZero() {
 		return false
 	}
@@ -868,11 +925,9 @@ func (w *WebSocketAdapter) checkOrderbookStaleness() bool {
 	connectionStart := w.connectionStart
 	w.connectionStartMu.RUnlock()
 
-	// 检查连接时间
 	connectionAge := time.Since(connectionStart).Seconds()
 	staleness := time.Since(lastUpdate).Seconds()
 
-	// 只有在有活动的情况下才检查过期（连接超过5秒且有更新）
 	if connectionAge > 5.0 && staleness > stalenessthresholdSecs {
 		w.log.Warnf("订单簿过期：最后更新 %v 秒前（阈值: %.1f秒）", staleness, stalenessthresholdSecs)
 		return true
@@ -880,4 +935,3 @@ func (w *WebSocketAdapter) checkOrderbookStaleness() bool {
 
 	return false
 }
-

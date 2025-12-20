@@ -16,4 +16,8 @@ type Adapter interface {
 	// Execution methods called by OMS.
 	PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) (oms.PlaceOrderResult, error)
 	CancelOrder(ctx context.Context, req oms.CancelOrderRequest) (oms.CancelOrderResult, error)
+
+	// MergePositions attempts to merge YES+NO positions into collateral.
+	// Returns txHash or error.
+	MergePositions(ctx context.Context, amount float64) (string, error)
 }

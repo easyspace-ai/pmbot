@@ -3,6 +3,7 @@ package market
 import (
 	"context"
 	"math"
+	"math/rand"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -36,6 +37,8 @@ func (d *Dummy) Start(ctx context.Context, bus *bus.Bus) error {
 	go func() {
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -57,13 +60,33 @@ func (d *Dummy) Start(ctx context.Context, bus *bus.Bus) error {
 					p = 0.99
 				}
 
+				// Generate YES side prices
+				bidYes := p - 0.01
+				askYes := p + 0.01
+
+				// Generate NO side prices
+				pNo := 1.0 - p
+				bidNo := pNo - 0.01
+				askNo := pNo + 0.01
+
+				// Randomly inject arbitrage opportunity (10% chance)
+				// Reduce asks so that askYes + askNo < 1.0
+				if rng.Float64() < 0.10 {
+					discount := 0.03 // Create 3 cent arbitrage
+					askYes -= discount/2
+					askNo -= discount/2
+					d.log.Debug("Injecting arbitrage opportunity!")
+				}
+
 				_ = bus.Publish(ctx, types.Event{
 					Type: types.EventMarketTick,
 					Payload: types.MarketTick{
 						MarketID:      "DUMMY-BTC-15M",
 						PYes:          p,
-						BestBid:       p - 0.01,
-						BestAsk:       p + 0.01,
+						BestBid:       bidYes,
+						BestAsk:       askYes,
+						BestBidNo:     bidNo,
+						BestAskNo:     askNo,
 						TimeRemaining: rem,
 						DataQuality:   0.95,
 					},
@@ -91,11 +114,8 @@ func (d *Dummy) PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) (oms.
 	return oms.PlaceOrderResult{ExchangeOrderID: "DUMMY-EX-" + req.ClientOrderID, Accepted: true}, nil
 }
 
-func (d *Dummy) CancelOrder(ctx context.Context, req oms.CancelOrderRequest) (oms.CancelOrderResult, error) {
-	_ = ctx
-	d.log.WithFields(map[string]interface{}{
-		"cid": req.ClientOrderID,
-		"oid": req.ExchangeOrderID,
-	}).Info("dummy cancel")
-	return oms.CancelOrderResult{Ok: true}, nil
+// MergePositions 实现 Adapter 接口（在 dummy 模式下模拟合并）
+func (d *Dummy) MergePositions(ctx context.Context, amount float64) (string, error) {
+	d.log.WithField("amount", amount).Info("dummy merge positions")
+	return "0xdummy_merge_tx_hash", nil
 }
