@@ -114,11 +114,8 @@ func (d *Dummy) PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) (oms.
 	return oms.PlaceOrderResult{ExchangeOrderID: "DUMMY-EX-" + req.ClientOrderID, Accepted: true}, nil
 }
 
-func (d *Dummy) CancelOrder(ctx context.Context, req oms.CancelOrderRequest) (oms.CancelOrderResult, error) {
-	_ = ctx
-	d.log.WithFields(map[string]interface{}{
-		"cid": req.ClientOrderID,
-		"oid": req.ExchangeOrderID,
-	}).Info("dummy cancel")
-	return oms.CancelOrderResult{Ok: true}, nil
+// MergePositions 实现 Adapter 接口（在 dummy 模式下模拟合并）
+func (d *Dummy) MergePositions(ctx context.Context, amount float64) (string, error) {
+	d.log.WithField("amount", amount).Info("dummy merge positions")
+	return "0xdummy_merge_tx_hash", nil
 }

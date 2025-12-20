@@ -808,12 +808,9 @@ func (w *WebSocketAdapter) PlaceOrder(ctx context.Context, req oms.PlaceOrderReq
 	}, fmt.Errorf("WebSocket adapter does not support order placement")
 }
 
-// CancelOrder 实现 Adapter 接口（委托给 HTTP 客户端）
-func (w *WebSocketAdapter) CancelOrder(ctx context.Context, req oms.CancelOrderRequest) (oms.CancelOrderResult, error) {
-	return oms.CancelOrderResult{
-		Ok:     false,
-		Reason: "WebSocket adapter does not support order cancellation, use HTTP adapter for trading",
-	}, fmt.Errorf("WebSocket adapter does not support order cancellation")
+// MergePositions 实现 Adapter 接口（WebSocket adapter 不支持合并）
+func (w *WebSocketAdapter) MergePositions(ctx context.Context, amount float64) (string, error) {
+	return "", fmt.Errorf("WebSocket adapter does not support merge positions, use HTTP adapter")
 }
 
 // Close 关闭连接

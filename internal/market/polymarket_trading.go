@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -74,6 +75,21 @@ func (p *Polymarket) initTrading(ctx context.Context) error {
 	chainID := clobtypes.Chain(p.chainID)
 	p.clobClient = clobclient.NewClient(p.baseURL, chainID, priv, clobCreds)
 
+	// 初始化CTF客户端（用于合并仓位）
+	rpcURL := getenvDefault("POLY_RPC_URL", "https://polygon-rpc.com")
+	ctfClient, err := clobclient.NewCTFClient(rpcURL, chainID, priv)
+	if err == nil {
+		p.ctfClient = ctfClient
+		p.log.Info("CTF client initialized", "rpc_url", rpcURL)
+		
+		// 启动自动合并循环（如果配置启用）
+		if os.Getenv("POLY_AUTO_MERGE") == "1" {
+			go p.autoMergeLoop(context.Background())
+		}
+	} else {
+		p.log.Warn("CTF client initialization failed (merge disabled)", "error", err)
+	}
+
 	p.log.Info("polymarket trading initialized",
 		"address", p.address,
 		"funder", p.funder,
@@ -81,6 +97,7 @@ func (p *Polymarket) initTrading(ctx context.Context) error {
 		"signature_type", p.signatureType,
 		"has_api_creds", p.apiCreds != nil,
 		"has_clob_client", p.clobClient != nil,
+		"has_ctf_client", p.ctfClient != nil,
 	)
 	return nil
 }
@@ -188,6 +205,80 @@ func (p *Polymarket) CancelOrder(ctx context.Context, req oms.CancelOrderRequest
 	return oms.CancelOrderResult{Ok: true}, nil
 }
 
+// MergePositions 尝试合并仓位
+func (p *Polymarket) MergePositions(ctx context.Context, amount float64) (string, error) {
+	if p.ctfClient == nil {
+		return "", fmt.Errorf("CTF client not initialized")
+	}
+
+	// 调用CTF客户端的MergePositions
+	// 注意：ConditionId 是 marketID
+	params := clobclient.MergePositionsParams{
+		ConditionId: p.marketID,
+		Amount:      amount,
+	}
+
+	tx, err := p.ctfClient.MergePositions(ctx, params)
+	if err != nil {
+		return "", err
+	}
+
+	// 发送交易
+	txHash, err := p.ctfClient.SendTransaction(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+
+	p.log.Infof("🚀 发送合并交易: %s, 数量: %.2f", txHash.Hex(), amount)
+	return txHash.Hex(), nil
+}
+
+// autoMergeLoop 自动合并循环
+func (p *Polymarket) autoMergeLoop(ctx context.Context) {
+	p.log.Info("🔄 启动自动合并循环")
+	ticker := time.NewTicker(5 * time.Second) // 每5秒检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.checkAndMerge(ctx)
+		}
+	}
+}
+
+// checkAndMerge 检查并合并
+func (p *Polymarket) checkAndMerge(ctx context.Context) {
+	if p.ctfClient == nil || p.marketID == "" {
+		return
+	}
+
+	// 查询可合并余额
+	// 由于我们已经在 CTFClient 中实现了 GetMergeableBalance，这里直接调用
+	mergeableAmount, err := p.ctfClient.GetMergeableBalance(ctx, p.marketID)
+	if err != nil {
+		p.log.Debugf("查询可合并余额失败: %v", err)
+		return
+	}
+
+	// 最小合并阈值 (1.0 USDC)
+	const minMergeThreshold = 1.0
+
+	if mergeableAmount >= minMergeThreshold {
+		p.log.Infof("💰 发现可合并仓位: %.2f (阈值: %.2f)，尝试合并...", mergeableAmount, minMergeThreshold)
+		
+		txHash, err := p.MergePositions(ctx, mergeableAmount)
+		if err != nil {
+			p.log.Errorf("合并仓位失败: %v", err)
+			return
+		}
+		
+		p.log.Infof("✅ 合并交易已发送: %s", txHash)
+	}
+}
+
 // --- Auth (L1/L2) ---
 
 func (p *Polymarket) createOrDeriveAPIKey(ctx context.Context, priv *ecdsa.PrivateKey) (*apiCreds, error) {
@@ -278,4 +369,3 @@ func parsePrivateKey(hexKey string) (*ecdsa.PrivateKey, common.Address, error) {
 	}
 	return priv, crypto.PubkeyToAddress(priv.PublicKey), nil
 }
-

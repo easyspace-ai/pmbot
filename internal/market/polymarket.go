@@ -59,6 +59,7 @@ type Polymarket struct {
 	signatureType  uint8
 	apiCreds       *apiCreds
 	clobClient     *clobclient.Client // CLOB客户端
+	ctfClient      *clobclient.CTFClient // CTF合约客户端
 
 	// L2 polling cursors/dedup
 	ordersCursor string

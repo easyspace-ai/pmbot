@@ -581,3 +581,46 @@ func (c *CTFClient) ValidateMergePositions(ctx context.Context, conditionId comm
 	return nil
 }
 
+// GetMergeableBalance 获取可合并的数量（YES和NO余额的最小值）
+func (c *CTFClient) GetMergeableBalance(ctx context.Context, conditionIdStr string) (float64, error) {
+	conditionId := common.HexToHash(conditionIdStr)
+	if conditionId == (common.Hash{}) {
+		return 0, fmt.Errorf("无效的conditionId")
+	}
+
+	parentCollectionId := common.Hash{}
+	
+	// YES
+	yesCollectionId, err := c.GetCollectionId(parentCollectionId, conditionId, big.NewInt(1))
+	if err != nil {
+		return 0, err
+	}
+	yesPositionId, err := c.GetPositionId(c.collateralToken, yesCollectionId)
+	if err != nil {
+		return 0, err
+	}
+	yesBalance, err := c.GetConditionalTokenBalance(ctx, yesPositionId)
+	if err != nil {
+		return 0, err
+	}
+
+	// NO
+	noCollectionId, err := c.GetCollectionId(parentCollectionId, conditionId, big.NewInt(2))
+	if err != nil {
+		return 0, err
+	}
+	noPositionId, err := c.GetPositionId(c.collateralToken, noCollectionId)
+	if err != nil {
+		return 0, err
+	}
+	noBalance, err := c.GetConditionalTokenBalance(ctx, noPositionId)
+	if err != nil {
+		return 0, err
+	}
+
+	// 返回较小值
+	if yesBalance < noBalance {
+		return yesBalance, nil
+	}
+	return noBalance, nil
+}
