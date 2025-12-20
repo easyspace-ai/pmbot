@@ -171,6 +171,12 @@ func (o *OMS) SetLogger(log *logrus.Logger) {
 // SetStrategy sets the strategy executor for converting Intent to orders.
 func (o *OMS) SetStrategy(s StrategyExecutor) {
 	o.strategy = s
+	// 如果策略支持 SetLogger，设置 logger
+	if s != nil && o.log != nil {
+		if setter, ok := s.(interface{ SetLogger(*logrus.Logger) }); ok {
+			setter.SetLogger(o.log)
+		}
+	}
 }
 
 // Reset clears all per-cycle state. Call when a new 15m cycle starts.

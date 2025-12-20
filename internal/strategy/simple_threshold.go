@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/sirupsen/logrus"
+
 	"polymarket-btc-bot/internal/oms"
 	"polymarket-btc-bot/internal/types"
 )
@@ -23,7 +25,7 @@ type SimpleThresholdStrategy struct {
 
 	// 状态
 	// 15m BTC Up/Down 是同一市场里的两个 outcome token。
-	// 这里用“每个方向每周期最多买一次”的状态，满足：
+	// 这里用"每个方向每周期最多买一次"的状态，满足：
 	// - UP 达到阈值就买 UP
 	// - DOWN 达到阈值就买 DOWN
 	// 且不会因为回报缺失/延迟而在同一方向反复下单。
@@ -34,6 +36,9 @@ type SimpleThresholdStrategy struct {
 	entryPrice        float64   // 最近一次入场价格
 	entrySide         types.Side // 最近一次入场方向
 	pendingSellPrice  float64   // 预留字段：未来实现卖出时使用
+
+	// Logger for debugging
+	log *logrus.Logger
 }
 
 // NewSimpleThresholdStrategy 创建简单阈值策略（使用默认配置）
@@ -47,7 +52,15 @@ func NewSimpleThresholdStrategyWithConfig(buyThreshold, profitTarget, orderSize 
 		buyThreshold: buyThreshold,
 		profitTarget: profitTarget,
 		orderSize:    orderSize,
+		log:          logrus.New(),
 	}
+}
+
+// SetLogger 设置日志记录器
+func (s *SimpleThresholdStrategy) SetLogger(log *logrus.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log = log
 }
 
 // SetConfig 设置策略配置（用于运行时更新配置）
@@ -79,6 +92,12 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 
 	upPrice := tick.PYes
 	downPrice := 1 - tick.PYes
+
+	// 调试日志
+	if s.log != nil {
+		s.log.Debugf("🔍 [策略] UP价格=%.4f, DOWN价格=%.4f, 阈值=%.4f, boughtYes=%v, boughtNo=%v",
+			upPrice, downPrice, s.buyThreshold, s.boughtYes, s.boughtNo)
+	}
 
 	// 规则：不论 UP/DOWN 哪个到阈值都买（每方向每周期最多一次）
 	if upPrice >= s.buyThreshold && !s.boughtYes {
@@ -114,6 +133,11 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 			buyPrice = noPrice
 		}
 
+		if s.log != nil {
+			s.log.Infof("✅ [策略] 触发买入NO: DOWN价格=%.4f >= 阈值=%.4f, 买入价格=%.4f, 数量=%.2f",
+				downPrice, s.buyThreshold, buyPrice, s.orderSize)
+		}
+
 		s.entryPrice = buyPrice
 		s.entrySide = types.SideNo
 		s.boughtNo = true
@@ -124,6 +148,13 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 			Size:   s.orderSize,
 			Reason: fmt.Sprintf("simple_threshold: DOWN价格=%.4f >= 阈值=%.4f, 买入NO(DOWN)", downPrice, s.buyThreshold),
 		})
+	} else if s.log != nil {
+		// 调试：为什么没有买入
+		if downPrice < s.buyThreshold {
+			s.log.Debugf("⏸️ [策略] DOWN价格=%.4f < 阈值=%.4f，未达到买入条件", downPrice, s.buyThreshold)
+		} else if s.boughtNo {
+			s.log.Debugf("⏸️ [策略] DOWN价格=%.4f >= 阈值=%.4f，但已买入过(boughtNo=true)，跳过", downPrice, s.buyThreshold)
+		}
 	}
 
 	return decisions
