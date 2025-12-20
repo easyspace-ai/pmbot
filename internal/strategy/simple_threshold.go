@@ -11,7 +11,8 @@ import (
 // SimpleThresholdStrategy 简单阈值策略
 // 规则：
 // 1. 当价格 > 60 分（0.60）时买入
-// 2. 买入后，自动挂限价单卖出，价格为买入价 + 3 个点（0.03）
+// 2. 本项目的执行层当前仅实现“买入”（SideBuy），未实现卖出（SideSell）。
+//    因此策略只负责触发一次买入信号；止盈/止损需要在执行层补齐卖出能力后再实现。
 type SimpleThresholdStrategy struct {
 	mu sync.RWMutex
 
@@ -69,13 +70,11 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 	hasNoPosition := pos.NoShares > 0
 	currentHasPosition := hasYesPosition || hasNoPosition
 
-	// 如果之前有持仓但现在没有了，重置状态（可能已卖出）
-	if s.hasPosition && !currentHasPosition {
-		s.hasPosition = false
-		s.entryPrice = 0
-		s.entrySide = types.SideUnknown
-		s.pendingSellPrice = 0
-	}
+	// 注意：
+	// position.Truth 只会在 Fill 到达后更新 shares。
+	// 如果这里用“pos 仍为 0”来判定“已卖出/没持仓”，会在成交回报缺失或延迟时触发重复下单。
+	// 为了安全起见：一旦本周期触发过入场（s.hasPosition=true），就不再自动重置，
+	// 只在周期切换（Reset）时清空状态。
 
 	// 策略逻辑：检查是否需要买入
 	// 确保每个周期只买一次：检查是否已经有持仓（通过 position 或策略状态）
@@ -95,17 +94,11 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 				buyPrice = tick.PYes
 			}
 
-			// 计算卖出价格（买入价 + 3 分）
-			sellPrice := buyPrice + s.profitTarget
-			if sellPrice > 0.99 {
-				sellPrice = 0.99 // 限制在合理范围内
-			}
-
 			// 记录状态
 			s.entryPrice = buyPrice
 			s.entrySide = types.SideYes
 			s.hasPosition = true
-			s.pendingSellPrice = sellPrice
+			s.pendingSellPrice = 0
 
 			// 生成买入决策
 			decisions = append(decisions, oms.OrderDecision{
@@ -113,14 +106,6 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 				Price:  buyPrice,
 				Size:   s.orderSize,
 				Reason: fmt.Sprintf("simple_threshold: UP价格=%.4f >= 阈值=%.4f, 买入YES", upPrice, s.buyThreshold),
-			})
-
-			// 同时挂卖出限价单（在买入价 + 3 分）
-			decisions = append(decisions, oms.OrderDecision{
-				Side:   types.SideNo, // 卖出 YES = 买入 NO
-				Price:  sellPrice,
-				Size:   s.orderSize,
-				Reason: "simple_threshold: auto sell at entry + 3c",
 			})
 		} else if downPrice >= s.buyThreshold {
 			// 检查 NO 价格是否超过阈值（1 - PYes）
@@ -135,17 +120,11 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 				buyPrice = noPrice
 			}
 
-			// 计算卖出价格
-			sellPrice := buyPrice + s.profitTarget
-			if sellPrice > 0.99 {
-				sellPrice = 0.99
-			}
-
 			// 记录状态
 			s.entryPrice = buyPrice
 			s.entrySide = types.SideNo
 			s.hasPosition = true
-			s.pendingSellPrice = sellPrice
+			s.pendingSellPrice = 0
 
 			// 生成买入决策
 			decisions = append(decisions, oms.OrderDecision{
@@ -154,34 +133,9 @@ func (s *SimpleThresholdStrategy) Execute(tick types.MarketTick, intent types.In
 				Size:   s.orderSize,
 				Reason: fmt.Sprintf("simple_threshold: DOWN价格=%.4f >= 阈值=%.4f, 买入NO", downPrice, s.buyThreshold),
 			})
-
-			// 同时挂卖出限价单
-			decisions = append(decisions, oms.OrderDecision{
-				Side:   types.SideYes, // 卖出 NO = 买入 YES
-				Price:  sellPrice,
-				Size:   s.orderSize,
-				Reason: "simple_threshold: auto sell at entry + 3c",
-			})
 		} else {
 			// 价格未达到阈值，不生成决策
 			// 调试信息已在 OMS 层面打印
-		}
-	} else {
-		// 已有持仓，检查是否需要更新卖出单
-		// 如果当前价格已经超过预期的卖出价格，可能需要调整
-		// 这里简化处理：如果价格变化较大，可以更新卖出价格
-		if s.entrySide == types.SideYes {
-			currentPrice := tick.PYes
-			// 如果价格已经超过卖出价，说明可能已经成交或需要更新
-			if currentPrice >= s.pendingSellPrice {
-				// 价格已经达到或超过目标，不需要额外操作
-				// 卖出单应该已经挂出或已成交
-			}
-		} else if s.entrySide == types.SideNo {
-			currentPrice := 1 - tick.PYes
-			if currentPrice >= s.pendingSellPrice {
-				// 价格已经达到或超过目标
-			}
 		}
 	}
 
