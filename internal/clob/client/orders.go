@@ -262,7 +262,7 @@ func (c *Client) CreateOrderWithFunder(ctx context.Context, req *types.UserOrder
 	return builder.BuildOrder(ctx, req, options)
 }
 
-// PlaceLimitOrder 下限价单（GTC - Good-Til-Cancelled）
+// PlaceLimitOrder 下限价单（默认为 GTC，支持通过 options 设置 TimeInForce）
 func (c *Client) PlaceLimitOrder(ctx context.Context, tokenID string, side types.Side, size float64, price float64, options *types.CreateOrderOptions) (*types.OrderResponse, error) {
 	if err := c.CanL2Auth(); err != nil {
 		return nil, err
@@ -274,6 +274,11 @@ func (c *Client) PlaceLimitOrder(ctx context.Context, tokenID string, side types
 		Side:    side,
 		Size:    size,
 		Price:   price,
+	}
+
+	// 如果设置了 TimeInForce = FOK，使用 FOK 精度逻辑
+	if options != nil && options.TimeInForce != nil && *options.TimeInForce == "FOK" {
+		return c.PlaceOrderFOK(ctx, tokenID, side, size, price, options)
 	}
 
 	// 构建并签名订单

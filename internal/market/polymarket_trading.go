@@ -136,10 +136,15 @@ func (p *Polymarket) PlaceOrder(ctx context.Context, req oms.PlaceOrderRequest) 
 	// 转换tickSize
 	tickSize := convertTickSize(p.minTickSize)
 
+	// 设置 TimeInForce 为 FOK (Fill Or Kill) 
+	// 这对于套利策略至关重要，防止单边成交
+	tif := "FOK"
+
 	// 创建订单选项
 	options := &clobtypes.CreateOrderOptions{
-		TickSize: tickSize,
-		NegRisk:  &p.negRisk,
+		TickSize:    tickSize,
+		NegRisk:     &p.negRisk,
+		TimeInForce: &tif,
 	}
 
 	// 使用CLOB客户端下单
@@ -263,20 +268,31 @@ func (p *Polymarket) checkAndMerge(ctx context.Context) {
 		return
 	}
 
-	// 最小合并阈值 (1.0 USDC)
-	const minMergeThreshold = 1.0
-
-	if mergeableAmount >= minMergeThreshold {
-		p.log.Infof("💰 发现可合并仓位: %.2f (阈值: %.2f)，尝试合并...", mergeableAmount, minMergeThreshold)
-		
-		txHash, err := p.MergePositions(ctx, mergeableAmount)
-		if err != nil {
-			p.log.Errorf("合并仓位失败: %v", err)
-			return
-		}
-		
-		p.log.Infof("✅ 合并交易已发送: %s", txHash)
+	// 最小合并阈值 (5.0 USDC) - 提高阈值以确保 Gas 费占比低
+	const minMergeThreshold = 5.0
+	
+	// 简单的 Gas 保护：如果余额太小，不值得花 Gas
+	// 注意：这里没有动态查询 Gas Price，而是使用了保守的阈值
+	if mergeableAmount < minMergeThreshold {
+		return
 	}
+
+	p.log.Infof("💰 发现可合并仓位: %.2f (阈值: %.2f)，尝试合并...", mergeableAmount, minMergeThreshold)
+	
+	// TODO: 在这里添加动态 Gas 估算逻辑
+	// estimateGasCost := p.estimateMergeGasCost(ctx)
+	// if mergeableAmount < estimateGasCost * 10 { return }
+
+	txHash, err := p.MergePositions(ctx, mergeableAmount)
+	if err != nil {
+		p.log.Errorf("合并仓位失败: %v", err)
+		return
+	}
+	
+	p.log.Infof("✅ 合并交易已发送: %s", txHash)
+	
+	// 这里可以发布一个状态重置事件，但这需要 Engine 支持
+	// 目前我们假设 Engine 会通过 Balance 查询最终看到变化
 }
 
 // --- Auth (L1/L2) ---
